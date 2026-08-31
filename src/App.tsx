@@ -1,10 +1,12 @@
-import { useRef, useEffect } from "react";
+import { useRef, useEffect, useCallback } from "react";
 import { useCamera } from "./hooks/useCamera";
 import { useMomentDetector } from "./hooks/useMomentDetector";
-import { useEditComposer } from "./hooks/useEditComposer";
+import { useEditPipeline } from "./hooks/useEditPipeline";
 import { Viewfinder, type ViewfinderHandle } from "./components/Viewfinder";
 import { MomentDebugBar } from "./components/MomentDebugBar";
 import { EditOverlay } from "./components/EditOverlay";
+import { TriggerConsole } from "./console/TriggerConsole";
+import type { TriggerEvent } from "./trigger/TriggerEvent";
 
 export default function App() {
   const { state: cameraState, restart } = useCamera();
@@ -29,17 +31,32 @@ export default function App() {
     clearLastEvent,
   } = useMomentDetector(videoRef, isActive);
 
-  const { currentEdit, trigger, dismiss, save } = useEditComposer();
+  const { currentEdit, fireTrigger, dismiss, save } = useEditPipeline();
 
-  // Wire detector events to composer
+  // Wire detector events to the shared pipeline
   useEffect(() => {
     if (!lastEvent) return;
     const video = videoRef.current;
     if (!video) return;
 
-    trigger(video, lastEvent.moment);
+    const event: TriggerEvent = {
+      source: "ai-detector",
+      moment: lastEvent.moment,
+      confidence: lastEvent.confidence,
+      at: lastEvent.at,
+    };
+    fireTrigger(video, event);
     clearLastEvent();
-  }, [lastEvent, trigger, clearLastEvent]);
+  }, [lastEvent, fireTrigger, clearLastEvent]);
+
+  const handleManualTrigger = useCallback(
+    (event: TriggerEvent) => {
+      const video = videoRef.current;
+      if (!video) return;
+      fireTrigger(video, event);
+    },
+    [fireTrigger]
+  );
 
   return (
     <div className="app">
@@ -72,6 +89,11 @@ export default function App() {
           />
         )}
       </main>
+
+      <TriggerConsole
+        onTrigger={handleManualTrigger}
+        disabled={!isActive}
+      />
 
       <MomentDebugBar
         scores={scores}

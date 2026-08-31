@@ -454,3 +454,121 @@ body {
     transform: scale(1);
   }
 }
+
+/* === Trigger Console === */
+.trigger-console {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 20px;
+  background: var(--bg-glass);
+  backdrop-filter: blur(20px);
+  border-top: 1px solid var(--border-subtle);
+  z-index: 10;
+  animation: fadeIn var(--transition-smooth) ease;
+}
+
+.trigger-console__label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  white-space: nowrap;
+  min-width: 64px;
+}
+
+.trigger-console__groups {
+  display: flex;
+  gap: 12px;
+  flex: 1;
+  overflow-x: auto;
+}
+
+.trigger-console__group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.trigger-console__group--wow {
+  border-left: 3px solid var(--accent-wow);
+}
+
+.trigger-console__group--funny {
+  border-left: 3px solid var(--accent-funny);
+}
+
+.trigger-console__group--sad {
+  border-left: 3px solid var(--accent-sad);
+}
+
+.trigger-console__group-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  min-width: 48px;
+}
+
+.trigger-console__buttons {
+  display: flex;
+  gap: 6px;
+}
+
+.trigger-console__btn {
+  padding: 6px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: var(--font);
+  color: var(--text-primary);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all var(--transition-fast);
+}
+
+.trigger-console__btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+}
+
+.trigger-console__btn--wow:hover:not(:disabled) {
+  border-color: var(--accent-wow);
+  box-shadow: 0 4px 16px rgba(255, 107, 53, 0.2);
+}
+
+.trigger-console__btn--funny:hover:not(:disabled) {
+  border-color: var(--accent-funny);
+  box-shadow: 0 4px 16px rgba(255, 215, 0, 0.2);
+}
+
+.trigger-console__btn--sad:hover:not(:disabled) {
+  border-color: var(--accent-sad);
+  box-shadow: 0 4px 16px rgba(74, 144, 217, 0.2);
+}
+
+.trigger-console__btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.trigger-console__btn--firing {
+  animation: btnFire 200ms ease;
+}
+
+@keyframes btnFire {
+  0% { transform: scale(1); }
+  50% { transform: scale(0.92); }
+  100% { transform: scale(1); }
+}
+

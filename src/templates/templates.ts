@@ -1,3 +1,4 @@
+import { z } from "zod/v4";
 import { type Template, parseTemplates } from "./schemas";
 
 /**
@@ -66,3 +67,18 @@ export function getRandomTemplate(moment: Template["moment"]): Template {
   const matching = getTemplatesForMoment(moment);
   return matching[Math.floor(Math.random() * matching.length)];
 }
+
+/** Valid template IDs, derived from the registry — stays in sync automatically. */
+const TEMPLATE_IDS = TEMPLATES.map((t) => t.id) as [string, ...string[]];
+const TemplateIdSchema = z.enum(TEMPLATE_IDS);
+
+/**
+ * Look up a template by exact ID.
+ * Throws a ZodError if the ID is not in the registry.
+ */
+export function getTemplateById(id: string): Template {
+  const validId = TemplateIdSchema.parse(id);
+  // Safe to assert: Zod already proved the ID exists in TEMPLATES
+  return TEMPLATES.find((t) => t.id === validId)!;
+}
+
