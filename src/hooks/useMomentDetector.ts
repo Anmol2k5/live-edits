@@ -9,6 +9,7 @@ export interface MomentDetectorHookResult {
   detectorState: DetectorState;
   lastEvent: MomentEvent | null;
   modelsReady: boolean;
+  modelError: string | null;
   clearLastEvent: () => void;
 }
 
@@ -21,23 +22,23 @@ export function useMomentDetector(
   const [detectorState, setDetectorState] = useState<DetectorState>({ status: "idle" });
   const [lastEvent, setLastEvent] = useState<MomentEvent | null>(null);
   const [modelsReady, setModelsReady] = useState(false);
+  const [modelError, setModelError] = useState<string | null>(null);
   const detectorRef = useRef<MomentDetector | null>(null);
-
   const clearLastEvent = useCallback(() => setLastEvent(null), []);
 
-  // Load models once
   useEffect(() => {
     let cancelled = false;
-    loadModels().then(() => {
-      if (!cancelled) setModelsReady(true);
-    });
+    void loadModels()
+      .then(() => { if (!cancelled) setModelsReady(true); })
+      .catch((error: unknown) => {
+        if (!cancelled) setModelError(`Could not load face models: ${String(error)}`);
+      });
     return () => { cancelled = true; };
   }, []);
 
-  // Create detector
   useEffect(() => {
     const detector = new MomentDetector(config);
-    detector.setOnMoment((event) => setLastEvent(event));
+    detector.setOnMoment(setLastEvent);
     detectorRef.current = detector;
     return () => {
       detector.reset();
@@ -45,32 +46,42 @@ export function useMomentDetector(
     };
   }, [config]);
 
-  // Polling loop
+  // Self-scheduling loop: no overlapping inference, even when processing takes >400ms.
   useEffect(() => {
     if (!active || !modelsReady) return;
-
     const detector = detectorRef.current;
     if (!detector) return;
 
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     detector.arm();
     setDetectorState(detector.getState());
 
-    const interval = setInterval(async () => {
+    const run = async () => {
+      if (cancelled) return;
       const video = videoRef.current;
-      if (!video || video.readyState < 2) return;
+      if (video && video.readyState >= 2) {
+        try {
+          const result = await detect(video);
+          if (!cancelled && videoRef.current === video) {
+            setScores(result);
+            detector.tick(result);
+            setDetectorState(detector.getState());
+          }
+        } catch (error) {
+          if (!cancelled) setModelError(`Face inference failed: ${String(error)}`);
+        }
+      }
+      if (!cancelled) timer = setTimeout(() => void run(), POLL_INTERVAL_MS);
+    };
 
-      const result = await detect(video);
-      setScores(result);
-      detector.tick(result);
-      setDetectorState(detector.getState());
-    }, POLL_INTERVAL_MS);
-
+    timer = setTimeout(() => void run(), POLL_INTERVAL_MS);
     return () => {
-      clearInterval(interval);
+      cancelled = true;
+      if (timer) clearTimeout(timer);
       detector.reset();
-      setDetectorState({ status: "idle" });
     };
   }, [active, modelsReady, videoRef]);
 
-  return { scores, detectorState, lastEvent, modelsReady, clearLastEvent };
+  return { scores, detectorState, lastEvent, modelsReady, modelError, clearLastEvent };
 }
