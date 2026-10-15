@@ -10,7 +10,9 @@
     "tauri": "tauri",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "relay": "node scripts/overlay-relay.mjs",
+    "test:relay": "node --test scripts/overlay-relay.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
