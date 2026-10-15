@@ -33,6 +33,6 @@ export default defineConfig(async () => ({
   test: {
     globals: true,
     environment: "jsdom",
-    exclude: [...configDefaults.exclude, "src-tauri/**"],
+    exclude: [...configDefaults.exclude, "src-tauri/**", "scripts/**"],
   },
 }));
