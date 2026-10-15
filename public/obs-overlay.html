@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Live Edits OBS Overlay</title>
+  <style>
+    html,body{width:100%;height:100%;margin:0;overflow:hidden;background:transparent!important;font-family:system-ui,sans-serif}
+    #stage{width:100%;height:100%;display:grid;place-items:center;pointer-events:none}
+    #effect{max-width:72%;max-height:72%;filter:drop-shadow(0 15px 25px #0008);animation:appear .23s cubic-bezier(.2,1.5,.3,1) both}
+    #effect img,#effect video{width:100%;max-height:67vh;object-fit:contain;border-radius:14px}
+    #debug{position:absolute;bottom:12px;left:12px;padding:7px 10px;color:white;background:#13172bc9;border-radius:8px;font-size:13px}
+    @keyframes appear{from{opacity:0;transform:translateY(25px) scale(.8)}to{opacity:1;transform:translateY(0) scale(1)}}
+  </style>
+</head>
+<body>
+  <main id="stage" aria-label="Stream effects"></main>
+  <div id="debug" hidden>Connecting to relay...</div>
+  <script>
+    const query=new URLSearchParams(location.search);
+    const stage=document.getElementById("stage");
+    const debug=document.getElementById("debug");
+    debug.hidden=query.get("debug")!=="1";
+    const queue=[];
+    let playing=false,lastSequence=0;
+    const status=message=>{debug.textContent=message};
+    const tone=()=>{
+      try{
+        const ctx=new (window.AudioContext||window.webkitAudioContext)();
+        const osc=ctx.createOscillator(),gain=ctx.createGain();
+        osc.frequency.value=620;gain.gain.setValueAtTime(.065,ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(.001,ctx.currentTime+.16);
+        osc.connect(gain);gain.connect(ctx.destination);osc.start();osc.stop(ctx.currentTime+.17);
+        osc.onended=()=>void ctx.close();
+      }catch{status("Sound blocked; check OBS audio settings")}
+    };
+    async function next(){
+      if(playing||!queue.length)return;
+      playing=true;
+      const event=queue.shift();
+      stage.replaceChildren();
+      status("Playing "+event.moment);
+      const wrapper=document.createElement("div");wrapper.id="effect";
+      const extension=event.mediaFile?.split(".").pop().toLowerCase();
+      let media;
+      if(["webm","mp4"].includes(extension)){
+        media=document.createElement("video");media.src="/media/"+encodeURIComponent(event.mediaFile);
+        media.autoplay=true;media.playsInline=true;media.muted=false;
+      }else if(["mp3","ogg","wav"].includes(extension)){
+        media=document.createElement("audio");media.src="/media/"+encodeURIComponent(event.mediaFile);
+        const fallback=document.createElement("img");fallback.src="/templates/"+event.templateId+".png";
+        wrapper.append(fallback);
+      }else{
+        media=document.createElement("img");
+        media.src=event.mediaFile?"/media/"+encodeURIComponent(event.mediaFile):"/templates/"+event.templateId+".png";
+        media.alt=event.moment+" reaction";
+      }
+      wrapper.append(media);stage.append(wrapper);
+      if(media.tagName==="VIDEO"||media.tagName==="AUDIO"){
+        try{await media.play()}catch(err){status("Media playback blocked: "+err.message)}
+      }else{tone();}
+      await new Promise(resolve=>setTimeout(resolve,event.durationMs));
+      if(typeof media.pause==="function")media.pause();
+      media.removeAttribute("src");if(typeof media.load==="function")media.load();
+      stage.replaceChildren();playing=false;void next();
+    }
+    const events=new EventSource("/events?token="+encodeURIComponent(query.get("token")||""));
+    events.onopen=()=>status("OBS overlay connected");
+    events.onerror=()=>status("OBS overlay reconnecting");
+    events.addEventListener("reaction",message=>{
+      try{
+        const reaction=JSON.parse(message.data);
+        if(reaction.sequence<=lastSequence)return;
+        lastSequence=reaction.sequence;
+        if(queue.length>=6)queue.shift();
+        queue.push(reaction);void next();
+      }catch{status("Malformed reaction event")}
+    });
+  </script>
+</body>
+</html>
