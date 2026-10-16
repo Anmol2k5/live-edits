@@ -1,0 +1,47 @@
+name: Live Edits SaaS integration
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  saas-real-services:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5432:5432
+      minio:
+        image: minio/minio:latest
+        env:
+          MINIO_ROOT_USER: test
+          MINIO_ROOT_PASSWORD: testtesttest
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/minio/health/live || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 9000:9000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run test:integration
+        env:
+          SAAS_TEST_DSN: postgres://postgres:postgres@localhost:5432/postgres
+          SAAS_TEST_S3_ENDPOINT: http://localhost:9000
+          SAAS_TEST_S3_KEY: test
+          SAAS_TEST_S3_SECRET: testtesttest

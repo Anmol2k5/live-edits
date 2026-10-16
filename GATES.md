@@ -108,6 +108,22 @@ CI passing does not close hardware/manual gates.
 - [ ] Physical webcam expression → OBS reaction — NOT TESTED (no webcam here)
 - [ ] Rust/Tauri desktop packaging — BLOCKED (no cargo/rustc)
 
+## Milestone 7.1 gates — production-capable SaaS foundation
+
+- [x] Recovery tokens never exposed: email provider interface + real SMTP (socket-level test), logging dev fallback, in-memory test capture
+- [x] Fail-closed production startup (secret, secure cookies, database, recovery mail) — `validateProductionConfig` + `server/src/index.ts`
+- [x] CSRF double-submit for cookie writes with Bearer exemption; web-cookie vs desktop-Bearer separation — tested accept/reject/exempt paths
+- [x] Rate limits (`429` + `Retry-After`), baseline security headers, session inventory + revoke-others
+- [x] Real PostgreSQL 17: declared `pg` dep, full SQL store, migrations executed, whole suite + races + restart/persistence green here (`npm run test:integration`)
+- [x] Real S3-compatible storage: `S3Storage` adapter exercised here against an S3 API service for uploads/downloads/validation/signed/replace/delete/quotas/cleanup/isolation; MinIO in CI (`saas.yml`); credentials never exposed
+- [x] Overlay reliability: Range delivery, full-config assignment resolution, no third-party art, backpressure drops + resync, revocation mid-playback, burst ordering — covered by unit + real-browser tests
+- [x] Real-browser slice extended (reconnect, rotate, revoke, reload) — `tests/e2e/saas.spec.ts`
+- [ ] S3/provider behavior at production scale — NOT VERIFIED
+- [ ] SSO/MFA, multi-instance limits sharing — NOT STARTED (documented)
+- [ ] Physical OBS Studio launch test on Windows — NOT TESTED (steps in docs/OBS_SETUP.md)
+- [ ] Physical webcam expression → OBS reaction — NOT TESTED (no webcam here)
+- [ ] Rust/Tauri desktop packaging — BLOCKED (no cargo/rustc)
+
 ## Milestone 3 gates — real-time video/audio reaction engine (OBS target)
 
 - [x] Tauri CSP allows only the loopback relay (`http://127.0.0.1:4190`, `http://localhost:4190`) in `connect-src`; all other M1 restrictions unchanged — `src-tauri/tauri.conf.json`

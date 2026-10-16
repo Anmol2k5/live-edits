@@ -5,10 +5,51 @@ export class SaasError extends Error {
   }
 }
 
+/**
+ * Authentication modes. Web browsers use HttpOnly cookies (+ CSRF) and
+ * never persist tokens; the desktop companion (Tauri) uses Bearer tokens
+ * kept out of cookies entirely. The two paths are separate by construction:
+ * cookie-authenticated writes require CSRF, Bearer writes are exempt.
+ */
+export type SaasAuthMode = "web" | "desktop";
+
 const TOKEN_KEY = "live-edits.saas.token";
 const BASE_KEY = "live-edits.saas.base";
 const WORKSPACE_KEY = "live-edits.saas.workspace";
+const MODE_KEY = "live-edits.saas.auth-mode";
 export const DEFAULT_SAAS_BASE = "http://127.0.0.1:4290";
+
+export function getAuthMode(): SaasAuthMode {
+  try {
+    const forced = localStorage.getItem(MODE_KEY);
+    if (forced === "desktop" || forced === "web") return forced;
+  } catch {
+    // ignore storage failures
+  }
+  return typeof window !== "undefined" && "__TAURI__" in window ? "desktop" : "web";
+}
+
+export function setAuthMode(mode: SaasAuthMode): void {
+  try {
+    localStorage.setItem(MODE_KEY, mode);
+  } catch {
+    // ignore
+  }
+}
+
+function readCsrfCookie(): string {
+  try {
+    for (const part of document.cookie.split(";")) {
+      const eq = part.indexOf("=");
+      if (eq > 0 && part.slice(0, eq).trim() === "le_csrf") {
+        return decodeURIComponent(part.slice(eq + 1).trim());
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return "";
+}
 
 export function loadSaasBase(): string {
   try {
@@ -35,6 +76,10 @@ export function loadSaasToken(): string {
 }
 
 export function saveSaasToken(token: string): void {
+  // Desktop-only persistence: the Tauri companion keeps its Bearer token in
+  // OS secure storage; this localStorage entry is the browser stand-in used
+  // by e2e. Web mode never calls this (HttpOnly cookie instead).
+  if (getAuthMode() !== "desktop") return;
   try {
     if (token) localStorage.setItem(TOKEN_KEY, token);
     else localStorage.removeItem(TOKEN_KEY);
@@ -65,11 +110,15 @@ function baseOf(base: string): string {
 }
 
 async function request(base: string, token: string, method: string, path: string, body?: unknown): Promise<unknown> {
+  const desktop = getAuthMode() === "desktop";
+  const csrf = desktop ? "" : readCsrfCookie();
   const response = await fetch(`${baseOf(base)}${path}`, {
     method,
+    credentials: "include",
     headers: {
       ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(desktop && token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(!desktop && csrf ? { "X-CSRF-Token": csrf } : {}),
     },
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
@@ -103,6 +152,11 @@ export const saasApi = {
   },
   patchAccount: (base: string, token: string, patch: { displayName?: string; currentPassword?: string; newPassword?: string }): Promise<{ user: { displayName: string }; token?: string }> =>
     request(base, token, "PATCH", "/api/auth/account", patch) as Promise<{ user: { displayName: string }; token?: string }>,
+  listSessions: (base: string, token: string): Promise<{ sessions: Array<{ id: string; current: boolean; createdAt: number; lastSeenAt: number }> }> =>
+    request(base, token, "GET", "/api/auth/sessions") as Promise<{ sessions: Array<{ id: string; current: boolean; createdAt: number; lastSeenAt: number }> }>,
+  revokeOtherSessions: (base: string, token: string): Promise<void> => {
+    return request(base, token, "DELETE", "/api/auth/sessions").then(() => undefined);
+  },
 
   createWorkspace: (base: string, token: string, name: string): Promise<{ workspace: { id: string; name: string } }> =>
     request(base, token, "POST", "/api/workspaces", { name }) as Promise<{ workspace: { id: string; name: string } }>,
@@ -131,9 +185,17 @@ export const saasApi = {
   listMedia: (base: string, token: string, ws: string): Promise<{ media: Array<{ name: string; bytes: number; kind: string; version: number }> }> =>
     request(base, token, "GET", `/api/workspaces/${encodeURIComponent(ws)}/media`) as Promise<{ media: Array<{ name: string; bytes: number; kind: string; version: number }> }>,
   uploadMedia: async (base: string, token: string, ws: string, file: File): Promise<{ name: string }> => {
+    const desktop = getAuthMode() === "desktop";
+    const csrf = desktop ? "" : readCsrfCookie();
     const response = await fetch(`${baseOf(base)}/api/workspaces/${encodeURIComponent(ws)}/media`, {
       method: "POST",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": file.type || "application/octet-stream", "X-Filename": encodeURIComponent(file.name) },
+      credentials: "include",
+      headers: {
+        ...(desktop && token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(!desktop && csrf ? { "X-CSRF-Token": csrf } : {}),
+        "Content-Type": file.type || "application/octet-stream",
+        "X-Filename": encodeURIComponent(file.name),
+      },
       body: file,
     });
     if (response.status === 201) return (await response.json()) as { name: string };

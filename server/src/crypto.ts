@@ -42,3 +42,12 @@ export function tokensEqual(a: string, b: string): boolean {
 export function signUrl(secret: string, payload: string): string {
   return createHmac("sha256", secret).update(payload, "utf8").digest("hex");
 }
+
+/**
+ * Double-submit CSRF token bound to a session token. The server recomputes
+ * it from the presented session, so no per-session storage is needed and
+ * the token is useless without the session itself.
+ */
+export function csrfTokenFor(secret: string, sessionToken: string): string {
+  return createHmac("sha256", secret).update(`csrf:${sessionToken}`, "utf8").digest("hex");
+}

@@ -54,6 +54,7 @@ storage. Details: `docs/SAAS_ARCHITECTURE.md`, `docs/SAAS_SECURITY.md`.
 - `npm run test:relay` — Node relay tests + shared scheduler conformance
 - `npm run test:e2e` — Playwright real-Chromium tests: `playback` project (overlay suite + editor→OBS workflow + hosted SaaS slice) and `autoplay-default` project (graceful refusal, never an audibility claim). Needs system Chrome or `playwright install`; point TEMP at a writable disk if C: is full
 - `npm run saas` — hosted SaaS backend (needs no extra deps for memory store + filesystem storage; Postgres via `DATABASE_URL` + `pg`, S3 via `LIVE_EDITS_S3_*`)
+- `npm run test:integration` — server suite + restart/persistence flow against real PostgreSQL + S3 (see `docs/SAAS_OPERATIONS.md`)
 - `npm run build` — frontend production build
 - `npm run tauri build` — desktop packaging (requires Rust and desktop toolchain)
 - `npm audit` — dependency audit (currently 0 vulnerabilities)

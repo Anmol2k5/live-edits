@@ -3,38 +3,84 @@ import { randomBytes } from "node:crypto";
 import { z } from "zod/v4";
 import type { Store } from "./store.ts";
 import { MemoryStore } from "./store.ts";
-import { FilesystemStorage, StorageError, s3ConfigFromEnv, connectS3, signMediaUrl, verifyMediaUrl } from "./storage.ts";
+import { FilesystemStorage, StorageError, s3ConfigFromEnv, connectS3, signMediaUrl, verifyMediaUrl, type MediaStorage } from "./storage.ts";
 import { parseServerPack, importServerPack, type ServerPack } from "./packs.ts";
-import { OverlayHub, validateTrigger, hostedOverlayHtml, schedulerCoreJs } from "./overlays.ts";
+import { OverlayHub, validateTrigger, hostedOverlayHtml, schedulerCoreJs, isTemplateAsset, templatePngBytes } from "./overlays.ts";
 import {
   AccountPatchSchema, EmailSchema, LoginSchema, RecoverConfirmSchema, RecoverRequestSchema, RegisterSchema,
   RoleSchema, TriggerPublishSchema, WorkspaceNameSchema,
   SESSION_TTL_MS, RESET_TTL_MS, SIGNED_URL_TTL_MS, WORKSPACE_QUOTA_BYTES, type Role,
 } from "./types.ts";
-import { hashPassword, verifyPassword, newToken, sha256Hex } from "./crypto.ts";
+import { hashPassword, verifyPassword, newToken, sha256Hex, csrfTokenFor, tokensEqual } from "./crypto.ts";
+import { LoggingEmailProvider, resetUrlFor, type EmailProvider } from "./email.ts";
 
 function sessionTtlMs(): number {
   const raw = Number(process.env["LIVE_EDITS_SESSION_TTL_MS"] ?? "");
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : SESSION_TTL_MS;
 }
 
+export interface ProductionConfig {
+  nodeEnv: string;
+  sessionSecret: string;
+  cookieSecure: boolean;
+  databaseUrl: string;
+  emailConfigured: boolean;
+  persistentStore: boolean;
+}
+
+/**
+ * Fail-closed production gate. Missing secrets, insecure cookies, absent
+ * database configuration, or no recovery-mail provider refuse startup
+ * instead of running degraded. Unit-tested in security.test.ts.
+ */
+export function validateProductionConfig(cfg: ProductionConfig): void {
+  if (cfg.nodeEnv !== "production") return;
+  const problems: string[] = [];
+  if (!cfg.sessionSecret || cfg.sessionSecret.length < 32) {
+    problems.push("LIVE_EDITS_SESSION_SECRET must be set (32+ characters).");
+  }
+  if (!cfg.cookieSecure) problems.push("LIVE_EDITS_COOKIE_SECURE=1 is required (HTTPS-only cookies).");
+  if (!cfg.databaseUrl) problems.push("DATABASE_URL is required (no memory store in production).");
+  if (!cfg.persistentStore) problems.push("A persistent store is required in production.");
+  if (!cfg.emailConfigured) problems.push("SMTP_HOST (+ user/pass/from) is required for password recovery.");
+  if (problems.length > 0) {
+    throw new Error(`Refusing to start in production:\n- ${problems.join("\n- ")}`);
+  }
+}
+
 export interface SaasOptions {
   store?: Store;
-  storage?: FilesystemStorage;
+  storage?: MediaStorage;
   secret?: string;
   quotaBytes?: number;
   corsOrigins?: string[];
-  exposeResetToken?: boolean;
   storageDir?: string;
+  email?: EmailProvider;
+  appBaseUrl?: string;
 }
 
 const MAX_JSON = 256 * 1024;
-const AUTH_WINDOW_MS = 60_000;
-const AUTH_MAX = 20;
+
+interface RateBucket {
+  count: number;
+  resetAt: number;
+}
 
 function json(res: ServerResponse, status: number, body: unknown): void {
+  secureHeaders(res);
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
   res.end(JSON.stringify(body));
+}
+
+/** Baseline hardening headers for every API response. */
+function secureHeaders(res: ServerResponse): void {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
+  if ((process.env["LIVE_EDITS_COOKIE_SECURE"] ?? "") === "1") {
+    res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  }
 }
 
 function readJson(req: IncomingMessage): Promise<unknown> {
@@ -73,28 +119,131 @@ function parseCookies(req: IncomingMessage): Record<string, string> {
   return out;
 }
 
-function sessionTokenOf(req: IncomingMessage): string | null {
+function sessionTokenOf(req: IncomingMessage): { token: string; via: "bearer" | "cookie" } | null {
   const auth = req.headers.authorization;
-  if (auth && /^Bearer /i.test(auth)) return auth.replace(/^Bearer /i, "").trim() || null;
+  if (auth && /^Bearer /i.test(auth)) {
+    const token = auth.replace(/^Bearer /i, "").trim();
+    return token ? { token, via: "bearer" } : null;
+  }
   const cookies = parseCookies(req);
-  return cookies["le_session"] || null;
+  const token = cookies["le_session"] || "";
+  return token ? { token, via: "cookie" } : null;
 }
 
 function sessionCookie(token: string, secure: boolean): string {
   return `le_session=${encodeURIComponent(token)}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${Math.floor(sessionTtlMs() / 1000)}${secure ? "; Secure" : ""}`;
 }
 
-function clearedCookie(secure: boolean): string {
-  return `le_session=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0${secure ? "; Secure" : ""}`;
+function csrfCookie(csrf: string, secure: boolean): string {
+  // Readable by design (double-submit pattern); useless without the session.
+  return `le_csrf=${encodeURIComponent(csrf)}; Path=/; SameSite=Lax; Max-Age=${Math.floor(sessionTtlMs() / 1000)}${secure ? "; Secure" : ""}`;
+}
+
+function clearedCookies(secure: boolean): string[] {
+  const suffix = `${secure ? "; Secure" : ""}`;
+  return [
+    `le_session=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0${suffix}`,
+    `le_csrf=; Path=/; SameSite=Lax; Max-Age=0${suffix}`,
+  ];
 }
 
 const ROLE_RANK: Record<Role, number> = { member: 1, admin: 2, owner: 3 };
+
+function parseRange(header: string | undefined, size: number): { start: number; end: number } | { unsatisfiable: true } | null {
+  if (!header) return null;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!match) return null;
+  const startStr = match[1] ?? "";
+  const endStr = match[2] ?? "";
+  if (startStr === "" && endStr === "") return null;
+  if (startStr === "") {
+    const tail = Number(endStr);
+    if (!Number.isInteger(tail) || tail <= 0) return null;
+    return { start: Math.max(0, size - tail), end: size - 1 };
+  }
+  const start = Number(startStr);
+  const end = endStr === "" ? size - 1 : Number(endStr);
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || start >= size) {
+    return { unsatisfiable: true };
+  }
+  return { start, end: Math.min(end, size - 1) };
+}
+
+/**
+ * Bounded media serving with Range support and failed-stream handling. A
+ * stream error before headers becomes 404; mid-stream it destroys the
+ * response so clients never hang on half a file.
+ */
+function serveMedia(
+  req: IncomingMessage,
+  res: ServerResponse,
+  storage: MediaStorage,
+  workspaceId: string,
+  name: string,
+  bytes: number,
+  mime: string
+): void {
+  const ranged = parseRange(req.headers.range, bytes);
+  if (ranged && "unsatisfiable" in ranged) {
+    res.writeHead(416, { "Content-Range": `bytes */${bytes}`, "Accept-Ranges": "bytes" });
+    res.end();
+    return;
+  }
+  let stream: NodeJS.ReadableStream;
+  try {
+    stream = ranged ? storage.stream(workspaceId, name, { start: ranged.start, end: ranged.end }) : storage.stream(workspaceId, name);
+  } catch {
+    if (!res.headersSent) json(res, 404, { error: "not found" });
+    return;
+  }
+  let headersSent = false;
+  stream.on("error", () => {
+    if (!headersSent) {
+      if (!res.headersSent) json(res, 404, { error: "not found" });
+    } else {
+      try {
+        res.destroy();
+      } catch {
+        // ignore
+      }
+    }
+  });
+  req.on("close", () => {
+    try {
+      (stream as unknown as { destroy: () => void }).destroy();
+    } catch {
+      // ignore
+    }
+  });
+  if (ranged) {
+    headersSent = true;
+    res.writeHead(206, {
+      "Content-Type": mime,
+      "Content-Length": String(ranged.end - ranged.start + 1),
+      "Content-Range": `bytes ${ranged.start}-${ranged.end}/${bytes}`,
+      "Accept-Ranges": "bytes",
+      "Cache-Control": "private, max-age=60",
+    });
+    stream.pipe(res);
+    return;
+  }
+  headersSent = true;
+  res.writeHead(200, {
+    "Content-Type": mime,
+    "Content-Length": String(bytes),
+    "Accept-Ranges": "bytes",
+    "Cache-Control": "private, max-age=60",
+  });
+  stream.pipe(res);
+}
 
 export interface Authed {
   userId: string;
   email: string;
   displayName: string;
 }
+
+type SessionInfo = Authed & { tokenHash: string; sessionId: string; via: "bearer" | "cookie"; rawToken: string };
 
 export function createSaasApp(opts: SaasOptions = {}): {
   server: Server;
@@ -105,15 +254,16 @@ export function createSaasApp(opts: SaasOptions = {}): {
   secret: string;
 } {
   const store: Store = opts.store ?? new MemoryStore();
-  const storage: FilesystemStorage = opts.storage ?? new FilesystemStorage(opts.storageDir ?? "./data/saas-media");
+  const storage: MediaStorage = opts.storage ?? new FilesystemStorage(opts.storageDir ?? "./data/saas-media");
   const secret = opts.secret ?? randomBytes(32).toString("hex");
   const quotaBytes = opts.quotaBytes ?? WORKSPACE_QUOTA_BYTES;
   const corsOrigins = new Set(opts.corsOrigins ?? ["http://localhost:1420", "http://127.0.0.1:1420", "http://tauri.localhost", "tauri://localhost"]);
-  const exposeResetToken = opts.exposeResetToken ?? process.env["NODE_ENV"] !== "production";
   const cookieSecure = (process.env["LIVE_EDITS_COOKIE_SECURE"] ?? "") === "1";
+  const email: EmailProvider = opts.email ?? new LoggingEmailProvider();
+  const appBaseUrl = (opts.appBaseUrl ?? process.env["APP_BASE_URL"] ?? "").trim();
   const bootId = randomBytes(8).toString("hex");
   const hub = new OverlayHub(bootId);
-  const authHits = new Map<string, { count: number; resetAt: number }>();
+  const buckets = new Map<string, RateBucket>();
   void storage.init().catch(() => undefined);
   void connectS3(s3ConfigFromEnv());
 
@@ -122,33 +272,62 @@ export function createSaasApp(opts: SaasOptions = {}): {
     if (origin && corsOrigins.has(origin)) {
       res.setHeader("Access-Control-Allow-Origin", origin);
       res.setHeader("Vary", "Origin");
-      res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Filename");
+      res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Filename, X-CSRF-Token");
       res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
       res.setHeader("Access-Control-Allow-Credentials", "true");
     }
   }
 
-  function rateLimited(ip: string): boolean {
+  /** Per-key sliding-window limiter. Returns retry-after seconds when limited. */
+  function limited(key: string, max: number, windowMs = 60_000): number {
     const now = Date.now();
-    const entry = authHits.get(ip);
+    const entry = buckets.get(key);
     if (!entry || now > entry.resetAt) {
-      authHits.set(ip, { count: 1, resetAt: now + AUTH_WINDOW_MS });
-      return false;
+      buckets.set(key, { count: 1, resetAt: now + windowMs });
+      if (buckets.size > 10000) {
+        const oldest = buckets.keys().next();
+        if (!oldest.done) buckets.delete(oldest.value);
+      }
+      return 0;
     }
     entry.count += 1;
-    return entry.count > AUTH_MAX;
+    if (entry.count > max) return Math.ceil((entry.resetAt - now) / 1000);
+    return 0;
   }
 
-  async function authed(req: IncomingMessage): Promise<(Authed & { tokenHash: string; sessionId: string }) | null> {
-    const token = sessionTokenOf(req);
-    if (!token) return null;
-    const hash = sha256Hex(token);
+  function limitHit(res: ServerResponse, retryAfter: number): boolean {
+    if (retryAfter <= 0) return false;
+    res.setHeader("Retry-After", String(retryAfter));
+    json(res, 429, { error: "too many attempts" });
+    return true;
+  }
+
+  async function authed(req: IncomingMessage): Promise<SessionInfo | null> {
+    const presented = sessionTokenOf(req);
+    if (!presented) return null;
+    const hash = sha256Hex(presented.token);
     const session = await store.findSessionByHash(hash);
     if (!session || Date.now() > session.expiresAt) return null;
     const user = await store.findUserById(session.userId);
     if (!user) return null;
     await store.touchSession(session.id);
-    return { userId: user.id, email: user.email, displayName: user.displayName, tokenHash: hash, sessionId: session.id };
+    return { userId: user.id, email: user.email, displayName: user.displayName, tokenHash: hash, sessionId: session.id, via: presented.via, rawToken: presented.token };
+  }
+
+  /**
+   * CSRF gate for cookie-authenticated mutating requests. Bearer requests
+   * carry no ambient credentials and are exempt. Returns true when the
+   * request may proceed (sends 403 otherwise).
+   */
+  function csrfOk(req: IncomingMessage, res: ServerResponse, session: SessionInfo): boolean {
+    if (session.via === "bearer") return true;
+    const header = req.headers["x-csrf-token"];
+    const presented = Array.isArray(header) ? header[0] : header;
+    if (!presented || !tokensEqual(presented, csrfTokenFor(secret, session.rawToken))) {
+      json(res, 403, { error: "csrf required" });
+      return false;
+    }
+    return true;
   }
 
   async function membership(workspaceId: string, userId: string): Promise<{ role: Role } | null> {
@@ -162,6 +341,7 @@ export function createSaasApp(opts: SaasOptions = {}): {
   const server = createServer(async (req, res) => {
     try {
       cors(req, res);
+      secureHeaders(res);
       const url = new URL(req.url || "/", "http://127.0.0.1");
       const method = (req.method || "GET").toUpperCase();
       const ip = req.socket.remoteAddress || "unknown";
@@ -175,9 +355,9 @@ export function createSaasApp(opts: SaasOptions = {}): {
         return json(res, 200, { ok: true, bootId, connectedOverlays: hub.connectedOverlays(), time: new Date().toISOString() });
       }
 
-      // ---- auth ----
+      // ---- auth (public entry points: no session required) ----
       if (url.pathname === "/api/auth/register" && method === "POST") {
-        if (rateLimited(`reg:${ip}`)) return json(res, 429, { error: "too many attempts" });
+        if (limitHit(res, limited(`reg:${ip}`, 10))) return;
         const input = RegisterSchema.parse(await readJson(req));
         const existing = await store.findUserByEmail(input.email);
         if (existing) return json(res, 409, { error: "email taken" });
@@ -185,11 +365,11 @@ export function createSaasApp(opts: SaasOptions = {}): {
         const token = newToken();
         await store.createSession(user.id, sha256Hex(token), Date.now() + sessionTtlMs());
         await store.recordAudit({ workspaceId: null, actorId: user.id, action: "auth.register", target: user.id, meta: {} });
-        res.setHeader("Set-Cookie", sessionCookie(token, cookieSecure));
-        return json(res, 201, { user: { id: user.id, email: user.email, displayName: user.displayName, createdAt: user.createdAt }, token });
+        res.setHeader("Set-Cookie", [sessionCookie(token, cookieSecure), csrfCookie(csrfTokenFor(secret, token), cookieSecure)]);
+        return json(res, 201, { user: { id: user.id, email: user.email, displayName: user.displayName, createdAt: user.createdAt }, token, csrfToken: csrfTokenFor(secret, token) });
       }
       if (url.pathname === "/api/auth/login" && method === "POST") {
-        if (rateLimited(`login:${ip}`)) return json(res, 429, { error: "too many attempts" });
+        if (limitHit(res, limited(`login:${ip}`, 10))) return;
         const input = LoginSchema.parse(await readJson(req));
         const user = await store.findUserByEmail(input.email);
         if (!user || !verifyPassword(input.password, user.passwordHash)) {
@@ -197,13 +377,15 @@ export function createSaasApp(opts: SaasOptions = {}): {
         }
         const token = newToken();
         await store.createSession(user.id, sha256Hex(token), Date.now() + sessionTtlMs());
-        res.setHeader("Set-Cookie", sessionCookie(token, cookieSecure));
-        return json(res, 200, { user: { id: user.id, email: user.email, displayName: user.displayName, createdAt: user.createdAt }, token });
+        res.setHeader("Set-Cookie", [sessionCookie(token, cookieSecure), csrfCookie(csrfTokenFor(secret, token), cookieSecure)]);
+        return json(res, 200, { user: { id: user.id, email: user.email, displayName: user.displayName, createdAt: user.createdAt }, token, csrfToken: csrfTokenFor(secret, token) });
       }
       if (url.pathname === "/api/auth/logout" && method === "POST") {
-        const token = sessionTokenOf(req);
-        if (token) await store.deleteSessionByHash(sha256Hex(token));
-        res.setHeader("Set-Cookie", clearedCookie(cookieSecure));
+        const presented = sessionTokenOf(req);
+        const a = await authed(req);
+        if (a && presented?.via === "cookie" && !csrfOk(req, res, a)) return;
+        if (presented) await store.deleteSessionByHash(sha256Hex(presented.token));
+        res.setHeader("Set-Cookie", clearedCookies(cookieSecure));
         return json(res, 200, { ok: true });
       }
       if (url.pathname === "/api/auth/me" && method === "GET") {
@@ -214,15 +396,18 @@ export function createSaasApp(opts: SaasOptions = {}): {
         return json(res, 200, { user: { id: user.id, email: user.email, displayName: user.displayName, createdAt: user.createdAt } });
       }
       if (url.pathname === "/api/auth/recover/request" && method === "POST") {
-        if (rateLimited(`rec:${ip}`)) return json(res, 429, { error: "too many attempts" });
+        if (limitHit(res, limited(`rec:${ip}`, 5))) return;
         const input = RecoverRequestSchema.parse(await readJson(req));
         const user = await store.findUserByEmail(input.email);
-        // Always return ok to avoid account enumeration; token only when configured.
-        if (!user) return json(res, 200, { ok: true });
-        const token = newToken(24);
-        await store.createReset(user.id, sha256Hex(token), Date.now() + RESET_TTL_MS);
-        await store.recordAudit({ workspaceId: null, actorId: user.id, action: "auth.recover.request", target: user.id, meta: {} });
-        return json(res, 200, { ok: true, ...(exposeResetToken ? { resetToken: token } : {}) });
+        // Always ok: no account enumeration. The token travels by email only.
+        if (user) {
+          const token = newToken(24);
+          await store.createReset(user.id, sha256Hex(token), Date.now() + RESET_TTL_MS);
+          await store.recordAudit({ workspaceId: null, actorId: user.id, action: "auth.recover.request", target: user.id, meta: {} });
+          const base = appBaseUrl || `http://${req.headers.host ?? "127.0.0.1"}`;
+          await email.sendPasswordReset(user.email, resetUrlFor(base, token), Date.now() + RESET_TTL_MS);
+        }
+        return json(res, 200, { ok: true });
       }
       if (url.pathname === "/api/auth/recover/confirm" && method === "POST") {
         const input = RecoverConfirmSchema.parse(await readJson(req));
@@ -237,6 +422,7 @@ export function createSaasApp(opts: SaasOptions = {}): {
       if (url.pathname === "/api/auth/account" && method === "PATCH") {
         const a = await authed(req);
         if (!a) return json(res, 401, { error: "unauthorized" });
+        if (!csrfOk(req, res, a)) return;
         const input = AccountPatchSchema.parse(await readJson(req));
         const user = await store.findUserById(a.userId);
         if (!user) return json(res, 401, { error: "unauthorized" });
@@ -248,19 +434,40 @@ export function createSaasApp(opts: SaasOptions = {}): {
           await store.deleteSessionsForUser(user.id);
           const token = newToken();
           await store.createSession(user.id, sha256Hex(token), Date.now() + sessionTtlMs());
-          res.setHeader("Set-Cookie", sessionCookie(token, cookieSecure));
+          res.setHeader("Set-Cookie", [sessionCookie(token, cookieSecure), csrfCookie(csrfTokenFor(secret, token), cookieSecure)]);
           await store.recordAudit({ workspaceId: null, actorId: user.id, action: "auth.password.change", target: user.id, meta: {} });
           const updated = await store.findUserById(user.id);
-          return json(res, 200, { user: { id: user!.id, email: user!.email, displayName: updated!.displayName, createdAt: user!.createdAt }, token });
+          return json(res, 200, { user: { id: user!.id, email: user!.email, displayName: updated!.displayName, createdAt: user!.createdAt }, token, csrfToken: csrfTokenFor(secret, token) });
         }
         const updated = await store.updateUser(user.id, { displayName: input.displayName ?? user.displayName });
         return json(res, 200, { user: { id: user!.id, email: user!.email, displayName: updated!.displayName, createdAt: user!.createdAt } });
+      }
+      if (url.pathname === "/api/auth/sessions" && method === "GET") {
+        const a = await authed(req);
+        if (!a) return json(res, 401, { error: "unauthorized" });
+        const rows = await store.listSessions(a.userId);
+        return json(res, 200, { sessions: rows.map((s) => ({ id: s.id, current: s.id === a.sessionId, createdAt: s.createdAt, lastSeenAt: s.lastSeenAt })) });
+      }
+      if (url.pathname === "/api/auth/sessions" && method === "DELETE") {
+        const a = await authed(req);
+        if (!a) return json(res, 401, { error: "unauthorized" });
+        if (!csrfOk(req, res, a)) return;
+        const revokeAll = url.searchParams.get("all") === "1";
+        if (revokeAll) {
+          await store.deleteSessionsForUser(a.userId);
+          res.setHeader("Set-Cookie", clearedCookies(cookieSecure));
+        } else {
+          await store.deleteOtherSessions(a.userId, a.sessionId);
+        }
+        await store.recordAudit({ workspaceId: null, actorId: a.userId, action: "auth.sessions.revoke", target: a.userId, meta: { all: revokeAll } });
+        return json(res, 200, { revoked: revokeAll ? "all" : "others" });
       }
 
       // ---- workspaces ----
       if (url.pathname === "/api/workspaces" && method === "POST") {
         const a = await authed(req);
         if (!a) return json(res, 401, { error: "unauthorized" });
+        if (!csrfOk(req, res, a)) return;
         const body = (await readJson(req)) as { name?: unknown };
         const name = WorkspaceNameSchema.parse(body.name);
         const ws = await store.createWorkspace(name, a.userId);
@@ -286,6 +493,8 @@ export function createSaasApp(opts: SaasOptions = {}): {
           await store.recordAudit({ workspaceId: /^[0-9a-fA-F-]{8,64}$/.test(workspaceId) ? workspaceId : null, actorId: a.userId, action: "workspace.denied", target: url.pathname, meta: {} });
           return json(res, 404, { error: "not found" });
         }
+        // Cookie-authenticated writes need a CSRF token; Bearer calls are exempt.
+        if ((method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE") && !csrfOk(req, res, a)) return;
         const need = (role: Role): boolean => ROLE_RANK[mem.role] >= ROLE_RANK[role];
 
         if ((rest === "" || rest === "/") && method === "GET") {
@@ -435,9 +644,7 @@ export function createSaasApp(opts: SaasOptions = {}): {
           if (sub === "" && method === "GET") {
             const row = await store.findMedia(workspaceId, mediaName);
             if (!row) return json(res, 404, { error: "not found" });
-            const mime = row.mime || "application/octet-stream";
-            res.writeHead(200, { "Content-Type": mime, "Content-Length": row.bytes, "Cache-Control": "private, max-age=60", "X-Content-Type-Options": "nosniff" });
-            storage.stream(workspaceId, mediaName).pipe(res);
+            serveMedia(req, res, storage, workspaceId, mediaName, row.bytes, row.mime || "application/octet-stream");
             return;
           }
           if (sub === "" && method === "PUT") {
@@ -519,6 +726,7 @@ export function createSaasApp(opts: SaasOptions = {}): {
 
         // ---- trigger ----
         if (rest === "/trigger" && method === "POST") {
+          if (limitHit(res, limited(`trig:${ip}:${workspaceId}`, 120))) return;
           const body = await readJson(req);
           let parsed;
           try {
@@ -540,33 +748,39 @@ export function createSaasApp(opts: SaasOptions = {}): {
               return json(res, 202, { accepted: false, duplicate: true, connectedOverlays: hub.connectedOverlays(workspaceId) });
             }
           }
-          // Resolve effect + assignment policy through the active pack; V1 fallback otherwise.
+          // Resolve the effect through the active pack; V1 fallback otherwise.
+          // An explicitly referenced effect wins; otherwise the pack
+          // assignment for (manual, moment) — exact moment first, then
+          // source wildcards — supplies the FULL playback configuration
+          // (media, duration, volume, trim, position, queue, priority,
+          // cooldown), exactly like the local pipeline. Caller fields
+          // override effect defaults.
           let effect: { id: string; moment: string; mediaFile?: string; durationMs: number; volume: number; position: string; clipStartMs?: number; clipEndMs?: number; queue: string; priority: number; cooldownMs: number } | null = null;
-          let policy: { queue: string; priority: number; cooldownMs: number } | null = null;
           const ws = await store.findWorkspace(workspaceId);
           const activeUid = ws?.activePackUid ?? null;
           if (activeUid) {
             const packRow = await store.findPack(workspaceId, activeUid);
             const data = packRow?.data as ServerPack | undefined;
             if (data) {
-              if (parsed.effectId) {
-                const found = data.effects.find((e) => (e as { id: string }).id === parsed.effectId) as unknown as
+              const readEffect = (uid: string): typeof effect => {
+                const found = data.effects.find((e) => (e as { id: string }).id === uid) as unknown as
                   | { id: string; moment: string; mediaFile?: string; durationMs: number; volume?: number; position?: string; clipStartMs?: number; clipEndMs?: number; queue: string; priority: number; cooldownMs: number; enabled?: boolean }
                   | undefined;
-                if (found && found.enabled !== false) {
-                  effect = { id: found.id, moment: found.moment, mediaFile: found.mediaFile, durationMs: found.durationMs, volume: found.volume ?? 1, position: found.position ?? "center", clipStartMs: found.clipStartMs, clipEndMs: found.clipEndMs, queue: found.queue, priority: found.priority, cooldownMs: found.cooldownMs };
-                } else if (parsed.effectId) {
+                if (!found || found.enabled === false) return null;
+                return { id: found.id, moment: found.moment, mediaFile: found.mediaFile, durationMs: found.durationMs, volume: found.volume ?? 1, position: found.position ?? "center", clipStartMs: found.clipStartMs, clipEndMs: found.clipEndMs, queue: found.queue, priority: found.priority, cooldownMs: found.cooldownMs };
+              };
+              if (parsed.effectId) {
+                const found = readEffect(parsed.effectId);
+                if (!found) {
                   await store.recordTrigger({ workspaceId, effectUid: parsed.effectId, moment: parsed.moment, templateId: parsed.templateId, dedupKey, status: "rejected", delivered: 0, createdBy: a.userId });
                   return json(res, 400, { error: "unknown effect" });
                 }
-              }
-              const assignments = (data.assignments ?? []) as Array<{ source: string; moment?: string; effectId: string }>;
-              const match = assignments.find((x) => x.source === "manual" && x.moment === parsed.moment)
-                ?? assignments.find((x) => x.source === "manual" && x.moment === undefined);
-              if (match) {
-                const assigned = data.effects.find((e) => (e as { id: string }).id === match.effectId) as unknown as
-                  | { queue: string; priority: number; cooldownMs: number } | undefined;
-                if (assigned) policy = { queue: assigned.queue, priority: assigned.priority, cooldownMs: assigned.cooldownMs };
+                effect = found;
+              } else {
+                const assignments = (data.assignments ?? []) as Array<{ source: string; moment?: string; effectId: string }>;
+                const match = assignments.find((x) => x.source === "manual" && x.moment === parsed.moment)
+                  ?? assignments.find((x) => x.source === "manual" && x.moment === undefined);
+                if (match) effect = readEffect(match.effectId);
               }
             }
           }
@@ -590,9 +804,9 @@ export function createSaasApp(opts: SaasOptions = {}): {
             clipStartMs: parsed.clipStartMs ?? effect?.clipStartMs ?? null,
             clipEndMs: parsed.clipEndMs ?? effect?.clipEndMs ?? null,
             position: parsed.position ?? effect?.position ?? "center",
-            queue: parsed.queue ?? policy?.queue ?? effect?.queue ?? "replace",
-            priority: parsed.priority ?? policy?.priority ?? effect?.priority ?? 50,
-            cooldownMs: parsed.cooldownMs ?? policy?.cooldownMs ?? effect?.cooldownMs ?? 0,
+            queue: parsed.queue ?? effect?.queue ?? "replace",
+            priority: parsed.priority ?? effect?.priority ?? 50,
+            cooldownMs: parsed.cooldownMs ?? effect?.cooldownMs ?? 0,
             effectId: parsed.effectId ?? effect?.id ?? null,
             triggerId: parsed.triggerId ?? null,
             dedupKey,
@@ -631,7 +845,7 @@ export function createSaasApp(opts: SaasOptions = {}): {
           "Cache-Control": "no-store",
           "Referrer-Policy": "no-referrer",
           "X-Content-Type-Options": "nosniff",
-          "Content-Security-Policy": "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data: https:; media-src 'self';",
+          "Content-Security-Policy": "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; media-src 'self';",
         });
         res.end(hostedOverlayHtml(row.id));
         return;
@@ -641,6 +855,24 @@ export function createSaasApp(opts: SaasOptions = {}): {
         const body = await schedulerCoreJs();
         res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8", "Cache-Control": "private, max-age=60", "X-Content-Type-Options": "nosniff" });
         res.end(body);
+        return;
+      }
+      const overlayTemplate = /^\/o\/([^/]+)\/templates\/([^/]+)$/.exec(url.pathname);
+      if (overlayTemplate && method === "GET") {
+        // Bundled template art (public assets, like the local relay's
+        // /templates): proves identity via a known overlay id, no view
+        // token needed for non-secret frame art.
+        const oid = decodeURIComponent(overlayTemplate[1] ?? "");
+        const asset = overlayTemplate[2] ?? "";
+        const row = await store.findOverlayById(oid);
+        if (!row || !isTemplateAsset(asset)) return json(res, 404, { error: "not found" });
+        try {
+          const png = await templatePngBytes(asset);
+          res.writeHead(200, { "Content-Type": "image/png", "Content-Length": png.length, "Cache-Control": "private, max-age=3600", "X-Content-Type-Options": "nosniff" });
+          res.end(png);
+        } catch {
+          return json(res, 404, { error: "not found" });
+        }
         return;
       }
       const overlayEvents = /^\/o\/([^/]+)\/events$/.exec(url.pathname);
@@ -688,8 +920,7 @@ export function createSaasApp(opts: SaasOptions = {}): {
         if (!workspaceId) return json(res, 403, { error: "forbidden" });
         const media = await store.findMedia(workspaceId, mediaName);
         if (!media) return json(res, 404, { error: "not found" });
-        res.writeHead(200, { "Content-Type": media.mime || "application/octet-stream", "Content-Length": media.bytes, "Cache-Control": "private, max-age=60", "X-Content-Type-Options": "nosniff" });
-        storage.stream(workspaceId, mediaName).pipe(res);
+        serveMedia(req, res, storage, workspaceId, mediaName, media.bytes, media.mime || "application/octet-stream");
         return;
       }
 

@@ -5,18 +5,29 @@
 - Passwords: `scrypt` (N=16384, r=8, p=1, 64-byte derived key, 16-byte salt),
   verified with `timingSafeEqual`. Minimum length 10, maximum 200.
 - Sessions: opaque 64-hex-char tokens, stored as SHA-256, 7-day TTL
-  (`LIVE_EDITS_SESSION_TTL_MS` override for tests), revoked on logout,
-  password change, and recovery confirm. Transported as `Authorization:
-  Bearer` (dashboard `localStorage`) and an `HttpOnly; SameSite=Lax` cookie
-  (`le_session`). Production must serve HTTPS and set
-  `LIVE_EDITS_COOKIE_SECURE=1`.
-- Recovery: 1-hour single-use reset tokens (SHA-256 stored). The plaintext
-  is returned in the request response only when `NODE_ENV !== "production"`
-  (tests/dev); production must deliver it out of band (email) — the code path
-  is marked and the response omits it there.
-- Auth endpoints are rate-limited (20/min/IP) to slow credential stuffing.
-  Register/login failures return generic `401`/`409` without distinguishing
-  unknown users on recovery request (always `200 ok`).
+  (`LIVE_EDITS_SESSION_TTL_MS` override for tests), revocable per-device
+  (`GET/DELETE /api/auth/sessions`), revoked on logout, password change,
+  and recovery confirm.
+- Web dashboard: session travels in an `HttpOnly; SameSite=Lax` cookie
+  (`le_session`) with CSRF double-submit (`le_csrf` cookie + `X-CSRF-Token`
+  header required on cookie-authenticated POST/PUT/PATCH/DELETE; missing or
+  wrong token → `403`). Bearer tokens carry no ambient credentials and are
+  CSRF-exempt. Production sets `LIVE_EDITS_COOKIE_SECURE=1` (HTTPS-only
+  cookies + HSTS) and serves the dashboard same-origin.
+- Desktop companion (Tauri): separate Bearer path. Tokens live in memory
+  only; the browser `localStorage` entry is an explicit, documented
+  stand-in for OS secure storage used by automated tests.
+- Recovery: 1-hour single-use reset tokens (SHA-256 stored) delivered by a
+  real `EmailProvider` (SMTP over raw sockets with STARTTLS + AUTH in
+  production; append-only logging fallback in dev; in-memory capture in
+  tests). API responses never contain tokens — always `{ ok: true }` — and
+  unknown addresses behave identically (no enumeration).
+- Auth endpoints are rate-limited per IP (register/login 10/min, recovery
+  5/min, triggers 120/min per workspace) with `429` + `Retry-After`.
+  Failures return generic `401`/`409`.
+- Production startup is fail-closed (`validateProductionConfig`): missing
+  session secret, insecure cookies, absent `DATABASE_URL`, memory store, or
+  unconfigured recovery mail abort boot with explicit errors.
 
 ## Authorization
 
@@ -50,22 +61,33 @@
 
 ## Transport and triggers
 
-- CORS allowlist (dashboard origins only), `Vary: Origin`, credentials
-  supported. JSON bodies capped at 256 KB; media uses the raw streaming path.
+- Baseline headers on every API response: `nosniff`, `no-referrer`,
+  `DENY` framing, `frame-ancestors 'none'`; HSTS when production cookies
+  are secure. CORS allowlist (dashboard origins only) with credentials.
+  JSON bodies capped at 256 KB; media uses the raw streaming path.
 - Triggers: schema-validated (moment/template consistency, effect-id shape,
   volume/trim/position/queue/priority/cooldown ranges), expired rejected
   (`400`), `triggerId`/`dedupKey` deduplicated per workspace (in-memory ring
   of 500 + history lookup), unknown effects and missing media rejected
   (`400`), never broadcast to other workspaces. History rows distinguish
   `accepted`/`duplicate`/`rejected`.
+- Media delivery supports HTTP Range (`200`/`206`/`416`) on both dashboard
+  and overlay endpoints; failed streams destroy the response instead of
+  hanging; slow SSE readers are dropped past 64 KB lag (they reconnect and
+  resync via `hello`).
 
-## What is NOT yet done
+## What is verified, and what is NOT
 
-- No SSO/OAuth, no MFA, no device management; scrypt parameters are a
-  starting point (Argon2id recommended before production scale).
-- No per-IP throttling beyond auth endpoints, no WAF, no backup/restore
-  runbook for Postgres beyond the migration file.
-- S3 provider path is configured but exercised only as config validation in
-  tests; byte-level S3 integration needs provider credentials and is NOT
-  claimed verified (filesystem backend is what tests prove).
-- Physical OBS, Tauri packaging, webcam, and soak gates remain open.
+- Verified here: Postgres 17 constraint behavior (unique races, last-owner
+  guard, dedup lookup) and the full hosted flow on real Postgres + real S3
+  (`npm run test:integration`); SMTP delivery against a live socket server;
+  CSRF accept/reject/exempt paths; rate-limit `429`s; session expiry and
+  revocation; Range/416 behavior; revocation during playback; burst
+  ordering across workspaces; the real-browser slice with reconnect, rotate,
+  revoke, and reload.
+- S3 provider path runs against `moto_server` locally and `minio/minio` in
+  CI — both genuine S3-protocol services, not in-process mocks.
+- NOT verified here: production Postgres operations at scale, S3 at scale,
+  SSO/MFA, multi-instance rate-limit sharing (in-memory buckets need sticky
+  sessions or Redis), physical OBS/webcam, Tauri packaging, long soak —
+  gates stay open.

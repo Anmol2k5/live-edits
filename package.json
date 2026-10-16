@@ -14,12 +14,15 @@
     "relay": "node scripts/overlay-relay.mjs",
     "saas": "node server/src/index.ts",
     "test:relay": "node --test scripts/overlay-relay.test.mjs scripts/scheduler-conformance.test.mjs",
+    "test:integration": "node server/run-integration.mjs",
     "test:e2e": "playwright test"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1152.0",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",
     "@vladmandic/face-api": "^1.7.15",
+    "pg": "^8.23.1",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "zod": "^4.5.4"
@@ -31,6 +34,7 @@
     "@testing-library/react": "^16.3.3",
     "@types/jsdom": "^30.0.0",
     "@types/node": "^26.6.5",
+    "@types/pg": "^8.23.1",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",

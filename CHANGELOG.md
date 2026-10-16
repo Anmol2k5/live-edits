@@ -1,5 +1,30 @@
 # Changelog
 
+## M7.1 — Production-capable SaaS foundation (branch feature/obs-reaction-mvp)
+
+Scope: harden M7 only. No Twitch, no billing, no deploy, no release claim. Local app, relay, editor, and all M7 API contracts preserved.
+
+### Security hardening
+
+- Recovery tokens never leave the server: new `EmailProvider` interface with a real SMTP implementation (raw sockets, STARTTLS, AUTH, covered against a live socket server), logging fallback for dev, in-memory capture for tests.
+- Fail-closed production startup (`validateProductionConfig`): missing session secret, insecure cookies, absent `DATABASE_URL`, memory store, or unconfigured recovery mail abort boot.
+- CSRF double-submit for cookie-authenticated writes (`le_csrf` + `X-CSRF-Token`; Bearer exempt); web dashboard uses HttpOnly cookies while the desktop companion uses a separate Bearer path (no `localStorage` tokens in web mode).
+- Per-endpoint rate limits (register/login 10/min, recovery 5/min, triggers 120/min per workspace) with `429` + `Retry-After`; baseline security headers on every API response; per-device session inventory + revoke-others.
+
+### Real Postgres + S3, proven here
+
+- `pg` + `@aws-sdk/client-s3` declared; full `PostgresStore` SQL for every entity; real `S3Storage` adapter (streaming validated uploads, versioned replace, Range delivery, tenant-scoped keys, proxied signed delivery).
+- `npm run test:integration` runs the whole server suite plus a restart/persistence flow against real PostgreSQL 17 and a real S3 API (`moto_server` locally, `minio/minio` in the new `saas.yml` CI job): duplicate-registration and duplicate-upload races, session expiry, membership guards, save/reload consistency, reconnect/rotate/revoke mid-playback, burst ordering, backend restart with persisted records + media.
+
+### Overlay reliability
+
+- HTTP Range (`200`/`206`/`416`) on dashboard and overlay media; assigned effects resolve to full playback config (media, duration, volume, trim, position), not just policy; bundled template art served same-origin (third-party placeholders removed, CSP tightened); slow SSE readers dropped past 64 KB lag with reconnect resync; failed streams destroy instead of hanging.
+
+### Verification (actual runs, this environment)
+
+- `npm run typecheck` clean; `npm run test` green; `npm run test:relay` green; `npm run test:integration` 38/38 on real Postgres 17.4 + real S3; `npm run test:e2e` green incl. extended SaaS slice (reconnect, rotate, revoke, reload); `npm run build` success; `npm audit` 0 vulnerabilities.
+- NOT verified here: production Postgres at scale, S3 at scale, SSO/MFA, physical OBS/webcam, Tauri packaging, long soak — gates stay open.
+
 ## M7 — Hosted SaaS foundation (branch feature/obs-reaction-mvp)
 
 Scope: account → pack → media → overlay vertical slice only. No Twitch, no billing, no merge of PR #1, no deploy, no release claim. Local Tauri app, loopback relay, packs, editor, triggers, and playback are preserved and still fully tested.

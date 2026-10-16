@@ -6,7 +6,21 @@ import { TriggerPublishSchema, type TriggerPublish } from "./types.ts";
 
 const MAX_CLIENTS = 50;
 const MAX_DEDUP = 500;
+/** Bytes a slow SSE client may lag before it is dropped (it reconnects). */
+const MAX_PENDING_BYTES = 64 * 1024;
 const TEMPLATES = new Set(["wow-1", "wow-2", "funny-1", "funny-2", "sad-1", "sad-2"]);
+
+/** Bundled template art served to hosted overlays (public assets, no secret). */
+export function isTemplateAsset(name: string): boolean {
+  return typeof name === "string" && name.endsWith(".png") && TEMPLATES.has(name.slice(0, -4));
+}
+
+export async function templatePngBytes(name: string): Promise<Buffer> {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const full = resolve(here, "..", "..", "public", "templates", name);
+  const { readFile: read } = await import("node:fs/promises");
+  return read(full);
+}
 
 export interface OverlayEvent {
   bootId: string;
@@ -38,6 +52,7 @@ interface Client {
 
 export class OverlayHub {
   private clients = new Map<string, Set<Client>>();
+  private pending = new Map<ServerResponse, number>();
   private seenDedup = new Map<string, Map<string, number>>();
   private sequences = new Map<string, number>();
   readonly bootId: string;
@@ -82,6 +97,7 @@ export class OverlayHub {
 
   removeClient(workspaceId: string, res: ServerResponse): void {
     const set = this.clients.get(workspaceId);
+    this.pending.delete(res);
     if (!set) return;
     for (const c of [...set]) if (c.res === res) set.delete(c);
     if (set.size === 0) this.clients.delete(workspaceId);
@@ -97,6 +113,7 @@ export class OverlayHub {
         } catch {
           // ignore
         }
+        this.pending.delete(c.res);
         set.delete(c);
       }
     }
@@ -111,13 +128,34 @@ export class OverlayHub {
     const set = this.clients.get(workspaceId);
     if (!set || set.size === 0) return 0;
     const frame = `id: ${event.sequence}\nevent: reaction\ndata: ${JSON.stringify(event)}\n\n`;
+    const frameBytes = Buffer.byteLength(frame);
     let delivered = 0;
     for (const c of [...set]) {
       try {
-        c.res.write(frame);
+        const ok = c.res.write(frame);
+        if (!ok) {
+          const pending = (this.pending.get(c.res) ?? 0) + frameBytes;
+          this.pending.set(c.res, pending);
+          c.res.once("drain", () => this.pending.delete(c.res));
+          if (pending > MAX_PENDING_BYTES) {
+            // Hopelessly slow reader: drop it so one stuck overlay can
+            // never stall the workspace. EventSource reconnects.
+            set.delete(c);
+            this.pending.delete(c.res);
+            try {
+              c.res.destroy();
+            } catch {
+              // ignore
+            }
+            continue;
+          }
+        } else {
+          this.pending.delete(c.res);
+        }
         delivered += 1;
       } catch {
         set.delete(c);
+        this.pending.delete(c.res);
       }
     }
     return delivered;
@@ -208,8 +246,8 @@ wrapper.className=("effect effect--main "+positionClass(event.position)).trim();
 const src=mediaSrc(event);
 let media;
 if(event.mediaFile&&/\\.(webm|mp4)$/i.test(event.mediaFile)){media=document.createElement("video");media.src=src;media.autoplay=true;media.playsInline=true;media.muted=false;if(typeof event.volume==="number")media.volume=Math.min(1,Math.max(0,event.volume));}
-else if(event.mediaFile&&/\\.(mp3|ogg|wav)$/i.test(event.mediaFile)){media=document.createElement("audio");media.src=src;if(typeof event.volume==="number")media.volume=Math.min(1,Math.max(0,event.volume));const fb=document.createElement("img");fb.src="https://via.placeholder.com/320x180?text="+encodeURIComponent(event.moment);fb.alt=event.moment+" reaction";wrapper.append(fb);}
-else{media=document.createElement("img");media.src=src||("https://via.placeholder.com/320x180?text="+encodeURIComponent(event.moment));media.alt=event.moment+" reaction";}
+else if(event.mediaFile&&/\\.(mp3|ogg|wav)$/i.test(event.mediaFile)){media=document.createElement("audio");media.src=src;if(typeof event.volume==="number")media.volume=Math.min(1,Math.max(0,event.volume));const fb=document.createElement("img");fb.src="/o/"+overlayId+"/templates/"+event.templateId+".png";fb.alt=event.moment+" reaction";wrapper.append(fb);}
+else{media=document.createElement("img");media.src=src||("/o/"+overlayId+"/templates/"+event.templateId+".png");media.alt=event.moment+" reaction";}
 wrapper.append(media);stage.append(wrapper);status("Playing "+event.moment);
 const failed=await new Promise(resolve=>{media.addEventListener("error",()=>resolve(true),{once:true});
 const start=async()=>{try{if(media.tagName==="VIDEO"||media.tagName==="AUDIO")await media.play();}catch(err){status("Media playback blocked: "+err.message)}resolve(false);};

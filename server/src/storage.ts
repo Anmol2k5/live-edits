@@ -2,6 +2,17 @@ import { createReadStream, createWriteStream } from "node:fs";
 import { mkdir, open, readdir, rename, stat, unlink } from "node:fs/promises";
 import { createHash, randomBytes } from "node:crypto";
 import { basename, extname, join, resolve, sep } from "node:path";
+import { PassThrough } from "node:stream";
+import {
+  S3Client,
+  HeadBucketCommand,
+  CreateBucketCommand,
+  HeadObjectCommand,
+  PutObjectCommand,
+  DeleteObjectCommand,
+  GetObjectCommand,
+  ListObjectsV2Command,
+} from "@aws-sdk/client-s3";
 import { signUrl } from "./crypto.ts";
 import { MAX_MEDIA_BYTES } from "./types.ts";
 
@@ -56,6 +67,120 @@ export function sniffKind(head: Uint8Array, ext: string): "video" | "audio" | "i
   return null;
 }
 
+export interface ByteRange {
+  start: number;
+  end: number;
+}
+
+/** Storage backend contract: private per-workspace media. Both the
+ * filesystem backend (tests/dev) and the S3 backend (production
+ * providers like MinIO) implement it; credentials never leave the server. */
+export interface MediaStorage {
+  init(): Promise<void>;
+  put(
+    workspaceId: string,
+    name: string,
+    body: AsyncIterable<Uint8Array>,
+    declaredBytes: number | null,
+    currentUsageBytes: number,
+    quotaBytes: number
+  ): Promise<StoredFile>;
+  replace(
+    workspaceId: string,
+    name: string,
+    body: AsyncIterable<Uint8Array>,
+    declaredBytes: number | null,
+    usageExcludingFile: number,
+    quotaBytes: number,
+    prevVersion: number
+  ): Promise<StoredFile>;
+  remove(workspaceId: string, name: string): Promise<boolean>;
+  list(workspaceId: string): Promise<Array<{ name: string; bytes: number; kind: "video" | "audio" | "image" }>>;
+  stream(workspaceId: string, name: string, range?: ByteRange): NodeJS.ReadableStream;
+  describe(): string;
+}
+
+/** Spool a body to a temp file with bounded memory, enforcing the size cap
+ * and quota as bytes arrive; then sniff content vs extension. Shared by
+ * both backends so validation is identical everywhere. */
+async function spoolAndValidate(
+  tmpPath: string,
+  body: AsyncIterable<Uint8Array>,
+  declaredBytes: number | null,
+  usageBefore: number,
+  quotaBytes: number,
+  name: string
+): Promise<{ bytes: number; kind: "video" | "audio" | "image" }> {
+  if (declaredBytes !== null && Number.isFinite(declaredBytes) && declaredBytes > MAX_MEDIA_BYTES) {
+    throw new StorageError("Files over 50 MB are rejected.", "file too large");
+  }
+  let received = 0;
+  const out = createWriteStream(tmpPath);
+  const finished = new Promise<void>((ok, bad) => {
+    out.on("finish", ok);
+    out.on("error", bad);
+  });
+  let streamError: unknown = null;
+  try {
+    for await (const chunk of body) {
+      received += chunk.length;
+      if (received <= MAX_MEDIA_BYTES && usageBefore + received <= quotaBytes) {
+        if (!out.write(chunk)) await new Promise<void>((r) => out.once("drain", r));
+      }
+    }
+  } catch (err) {
+    streamError = err;
+  }
+  try {
+    out.end();
+  } catch {
+    // ignore
+  }
+  if (!streamError) {
+    try {
+      await finished;
+    } catch (err) {
+      streamError = err;
+    }
+  }
+  if (streamError) {
+    await unlink(tmpPath).catch(() => undefined);
+    throw streamError;
+  }
+  if (received === 0) {
+    await unlink(tmpPath).catch(() => undefined);
+    throw new StorageError("Empty files cannot be uploaded.", "empty file");
+  }
+  if (received > MAX_MEDIA_BYTES) {
+    await unlink(tmpPath).catch(() => undefined);
+    throw new StorageError("Files over 50 MB are rejected.", "file too large");
+  }
+  if (usageBefore + received > quotaBytes) {
+    await unlink(tmpPath).catch(() => undefined);
+    throw new StorageError("Workspace storage quota exceeded.", "quota exceeded");
+  }
+  const ext = extname(name).toLowerCase();
+  const expected = kindForExt(ext);
+  let head: Uint8Array | null = null;
+  try {
+    const handle = await open(tmpPath, "r");
+    try {
+      const buffer = Buffer.alloc(32);
+      const { bytesRead } = await handle.read(buffer, 0, 32, 0);
+      head = buffer.subarray(0, bytesRead);
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+  } catch {
+    head = null;
+  }
+  if (!head || head.length === 0 || !expected || sniffKind(head, ext) !== expected) {
+    await unlink(tmpPath).catch(() => undefined);
+    throw new StorageError("File content does not match its extension.", "content does not match the filename");
+  }
+  return { bytes: received, kind: expected };
+}
+
 export type StorageErrorCode =
   | "invalid filename"
   | "empty file"
@@ -106,11 +231,15 @@ function filePath(root: string, workspaceId: string, name: string): string {
  * providers plug in via S3StorageConfig without ever exposing credentials
  * to clients (all signing happens server-side).
  */
-export class FilesystemStorage {
+export class FilesystemStorage implements MediaStorage {
   private inFlight = new Set<string>();
   private readonly root: string;
   constructor(root: string) {
     this.root = root;
+  }
+
+  describe(): string {
+    return `filesystem storage at ${this.root}`;
   }
 
   async init(): Promise<void> {
@@ -122,9 +251,6 @@ export class FilesystemStorage {
     const full = filePath(this.root, workspaceId, name);
     const key = `${workspaceId}:${name}`;
     if (this.inFlight.has(key)) throw new StorageError("That file is already uploading.", "upload in progress");
-    if (declaredBytes !== null && Number.isFinite(declaredBytes) && declaredBytes > MAX_MEDIA_BYTES) {
-      throw new StorageError("Files over 50 MB are rejected.", "file too large");
-    }
     if (currentUsageBytes >= quotaBytes) throw new StorageError("Workspace storage quota exceeded.", "quota exceeded");
     this.inFlight.add(key);
     try {
@@ -133,137 +259,29 @@ export class FilesystemStorage {
       const dir = workspaceDir(this.root, workspaceId);
       await mkdir(dir, { recursive: true });
       const tmp = join(dir, `.upload-${randomBytes(8).toString("hex")}.part`);
-      let received = 0;
-      let streamError: unknown = null;
-      try {
-        const out = createWriteStream(tmp);
-        const finished = new Promise<void>((ok, bad) => {
-          out.on("finish", ok);
-          out.on("error", bad);
-        });
-        try {
-          for await (const chunk of body) {
-            received += chunk.length;
-            if (received <= MAX_MEDIA_BYTES && currentUsageBytes + received <= quotaBytes) {
-              if (!out.write(chunk)) await new Promise<void>((r) => out.once("drain", r));
-            }
-          }
-        } catch (err) {
-          streamError = err;
-        }
-        try {
-          out.end();
-        } catch {
-          // ignore
-        }
-        if (!streamError) {
-          try {
-            await finished;
-          } catch (err) {
-            streamError = err;
-          }
-        }
-        if (streamError) {
-          await unlink(tmp).catch(() => undefined);
-          throw streamError;
-        }
-      } catch (err) {
-        await unlink(tmp).catch(() => undefined);
-        throw err;
-      }
-      if (received === 0) {
-        await unlink(tmp).catch(() => undefined);
-        throw new StorageError("Empty files cannot be uploaded.", "empty file");
-      }
-      if (received > MAX_MEDIA_BYTES) {
-        await unlink(tmp).catch(() => undefined);
-        throw new StorageError("Files over 50 MB are rejected.", "file too large");
-      }
-      if (currentUsageBytes + received > quotaBytes) {
-        await unlink(tmp).catch(() => undefined);
-        throw new StorageError("Workspace storage quota exceeded.", "quota exceeded");
-      }
+      const { bytes, kind } = await spoolAndValidate(tmp, body, declaredBytes, currentUsageBytes, quotaBytes, name);
       const raced = await stat(full).catch(() => null);
       if (raced?.isFile()) {
         await unlink(tmp).catch(() => undefined);
         throw new StorageError("A file with that name already exists.", "exists");
       }
-      const ext = extname(name).toLowerCase();
-      const expected = kindForExt(ext);
-      let head: Uint8Array | null = null;
-      try {
-        const handle = await open(tmp, "r");
-        try {
-          const buffer = Buffer.alloc(32);
-          const { bytesRead } = await handle.read(buffer, 0, 32, 0);
-          head = buffer.subarray(0, bytesRead);
-        } finally {
-          await handle.close().catch(() => undefined);
-        }
-      } catch {
-        head = null;
-      }
-      if (!head || head.length === 0 || !expected || sniffKind(head, ext) !== expected) {
-        await unlink(tmp).catch(() => undefined);
-        throw new StorageError("File content does not match its extension.", "content does not match the filename");
-      }
       await rename(tmp, full);
-      return { bytes: received, kind: expected, storageKey: `${workspaceId}/${name}`, version: 1 };
+      return { bytes, kind, storageKey: `${workspaceId}/${name}`, version: 1 };
     } finally {
       this.inFlight.delete(key);
     }
   }
 
-  /** Atomic versioned replacement: writes the new bytes, swaps, bumps version. */
+  /** Atomic versioned replacement: validates the new bytes, swaps, bumps version. */
   async replace(workspaceId: string, name: string, body: AsyncIterable<Uint8Array>, declaredBytes: number | null, usageExcludingFile: number, quotaBytes: number, prevVersion: number): Promise<StoredFile> {
-    if (declaredBytes !== null && Number.isFinite(declaredBytes) && declaredBytes > MAX_MEDIA_BYTES) {
-      throw new StorageError("Files over 50 MB are rejected.", "file too large");
-    }
     const full = filePath(this.root, workspaceId, name);
     const existing = await stat(full).catch(() => null);
     if (!existing?.isFile()) throw new StorageError("File not found.", "not found");
     const dir = workspaceDir(this.root, workspaceId);
     const tmp = join(dir, `.upload-${randomBytes(8).toString("hex")}.part`);
-    let received = 0;
-    try {
-      const out = createWriteStream(tmp);
-      const finished = new Promise<void>((ok, bad) => {
-        out.on("finish", ok);
-        out.on("error", bad);
-      });
-      for await (const chunk of body) {
-        received += chunk.length;
-        if (received <= MAX_MEDIA_BYTES && usageExcludingFile + received <= quotaBytes) {
-          if (!out.write(chunk)) await new Promise<void>((r) => out.once("drain", r));
-        }
-      }
-      out.end();
-      await finished;
-    } catch (err) {
-      await unlink(tmp).catch(() => undefined);
-      throw err;
-    }
-    if (received === 0 || received > MAX_MEDIA_BYTES || usageExcludingFile + received > quotaBytes) {
-      await unlink(tmp).catch(() => undefined);
-      throw new StorageError(received === 0 ? "Empty files cannot be uploaded." : "File rejected (size or quota).", received === 0 ? "empty file" : "file too large");
-    }
-    const ext = extname(name).toLowerCase();
-    const expected = kindForExt(ext);
-    const handle = await open(tmp, "r");
-    let head: Uint8Array;
-    try {
-      const buffer = Buffer.alloc(32);
-      const { bytesRead } = await handle.read(buffer, 0, 32, 0);
-      head = buffer.subarray(0, bytesRead);
-    } finally {
-      await handle.close().catch(() => undefined);
-    }
-    if (!expected || sniffKind(head, ext) !== expected) {
-      await unlink(tmp).catch(() => undefined);
-      throw new StorageError("File content does not match its extension.", "content does not match the filename");
-    }
+    const { bytes, kind } = await spoolAndValidate(tmp, body, declaredBytes, usageExcludingFile, quotaBytes, name);
     await rename(tmp, full);
-    return { bytes: received, kind: expected, storageKey: `${workspaceId}/${name}`, version: prevVersion + 1 };
+    return { bytes, kind, storageKey: `${workspaceId}/${name}`, version: prevVersion + 1 };
   }
 
   async remove(workspaceId: string, name: string): Promise<boolean> {
@@ -286,8 +304,9 @@ export class FilesystemStorage {
     return items.sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  stream(workspaceId: string, name: string): ReturnType<typeof createReadStream> {
-    return createReadStream(filePath(this.root, workspaceId, name));
+  stream(workspaceId: string, name: string, range?: ByteRange): NodeJS.ReadableStream {
+    const full = filePath(this.root, workspaceId, name);
+    return range ? createReadStream(full, { start: range.start, end: range.end }) : createReadStream(full);
   }
 
   async residue(): Promise<string[]> {
@@ -323,6 +342,214 @@ export function s3ConfigFromEnv(env: NodeJS.ProcessEnv = process.env): S3Storage
     secretAccessKeyEnv: "LIVE_EDITS_S3_SECRET_KEY",
     forcePathStyle: (env["LIVE_EDITS_S3_FORCE_PATH_STYLE"] || "").trim() === "1",
   };
+}
+
+export interface S3ResolvedConfig {
+  endpoint: string;
+  region: string;
+  bucket: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  forcePathStyle: boolean;
+}
+
+/** Resolve credentials server-side; throws when partially configured (fail closed). */
+export function resolveS3Config(env: NodeJS.ProcessEnv = process.env): S3ResolvedConfig | null {
+  const base = s3ConfigFromEnv(env);
+  if (!base) return null;
+  const accessKeyId = (env[base.accessKeyIdEnv] || "").trim();
+  const secretAccessKey = env[base.secretAccessKeyEnv] ?? "";
+  if (!accessKeyId || !secretAccessKey) {
+    throw new Error(`S3 endpoint/bucket set but credentials missing (${base.accessKeyIdEnv}/${base.secretAccessKeyEnv}).`);
+  }
+  return { endpoint: base.endpoint, region: base.region, bucket: base.bucket, accessKeyId, secretAccessKey, forcePathStyle: base.forcePathStyle ?? false };
+}
+
+/**
+ * S3-compatible object storage (MinIO and similar). Objects live at
+ * `<workspace>/<name>`; uploads spool through a validated temp file first
+ * so content rules match the filesystem backend byte for byte. Delivery is
+ * proxied through the app (tenant-checked, revocable) — provider
+ * credentials are never exposed and no presigned URLs leak scope.
+ */
+export class S3Storage implements MediaStorage {
+  private inFlight = new Set<string>();
+  private readonly client: S3Client;
+  private readonly bucket: string;
+  private readonly config: S3ResolvedConfig;
+  private readonly stagingDir: string;
+
+  constructor(config: S3ResolvedConfig, stagingDir: string, client?: S3Client) {
+    this.config = config;
+    this.stagingDir = stagingDir;
+    this.bucket = config.bucket;
+    this.client =
+      client ??
+      new S3Client({
+        endpoint: config.endpoint,
+        region: config.region === "auto" ? "us-east-1" : config.region,
+        credentials: { accessKeyId: config.accessKeyId, secretAccessKey: config.secretAccessKey },
+        forcePathStyle: config.forcePathStyle,
+      });
+  }
+
+  describe(): string {
+    return `s3 storage at ${this.config.endpoint} bucket ${this.bucket} (credentials server-side only)`;
+  }
+
+  async init(): Promise<void> {
+    try {
+      await this.client.send(new HeadBucketCommand({ Bucket: this.bucket }));
+    } catch {
+      await this.client.send(new CreateBucketCommand({ Bucket: this.bucket }));
+    }
+    await mkdir(this.stagingDir, { recursive: true });
+  }
+
+  private key(workspaceId: string, name: string): string {
+    if (!validMediaName(name)) throw new StorageError("That filename is not allowed.", "invalid filename");
+    if (!/^[0-9a-fA-F-]{8,64}$/.test(workspaceId)) throw new StorageError("Invalid workspace.", "invalid filename");
+    return `${workspaceId}/${name}`;
+  }
+
+  private stagePath(): string {
+    return join(this.stagingDir, `.upload-${randomBytes(8).toString("hex")}.part`);
+  }
+
+  async put(
+    workspaceId: string,
+    name: string,
+    body: AsyncIterable<Uint8Array>,
+    declaredBytes: number | null,
+    currentUsageBytes: number,
+    quotaBytes: number
+  ): Promise<StoredFile> {
+    const objectKey = this.key(workspaceId, name);
+    const flight = `${workspaceId}:${name}`;
+    if (this.inFlight.has(flight)) throw new StorageError("That file is already uploading.", "upload in progress");
+    if (currentUsageBytes >= quotaBytes) throw new StorageError("Workspace storage quota exceeded.", "quota exceeded");
+    try {
+      await this.client.send(new HeadObjectCommand({ Bucket: this.bucket, Key: objectKey }));
+      throw new StorageError("A file with that name already exists.", "exists");
+    } catch (err) {
+      if (err instanceof StorageError) throw err;
+      // Missing object: proceed with the upload.
+    }
+    this.inFlight.add(flight);
+    const tmp = this.stagePath();
+    try {
+      const { bytes, kind } = await spoolAndValidate(tmp, body, declaredBytes, currentUsageBytes, quotaBytes, name);
+      try {
+        await this.client.send(
+          new PutObjectCommand({ Bucket: this.bucket, Key: objectKey, Body: createReadStream(tmp) as unknown as Uint8Array, ContentLength: bytes })
+        );
+      } catch (err) {
+        await this.client.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: objectKey })).catch(() => undefined);
+        throw err;
+      } finally {
+        await unlink(tmp).catch(() => undefined);
+      }
+      return { bytes, kind, storageKey: `s3:${this.bucket}/${objectKey}`, version: 1 };
+    } finally {
+      this.inFlight.delete(flight);
+      await unlink(tmp).catch(() => undefined);
+    }
+  }
+
+  async replace(
+    workspaceId: string,
+    name: string,
+    body: AsyncIterable<Uint8Array>,
+    declaredBytes: number | null,
+    usageExcludingFile: number,
+    quotaBytes: number,
+    prevVersion: number
+  ): Promise<StoredFile> {
+    const objectKey = this.key(workspaceId, name);
+    try {
+      await this.client.send(new HeadObjectCommand({ Bucket: this.bucket, Key: objectKey }));
+    } catch {
+      throw new StorageError("File not found.", "not found");
+    }
+    const tmp = this.stagePath();
+    try {
+      const { bytes, kind } = await spoolAndValidate(tmp, body, declaredBytes, usageExcludingFile, quotaBytes, name);
+      await this.client.send(
+        new PutObjectCommand({ Bucket: this.bucket, Key: objectKey, Body: createReadStream(tmp) as unknown as Uint8Array, ContentLength: bytes })
+      );
+      return { bytes, kind, storageKey: `s3:${this.bucket}/${objectKey}`, version: prevVersion + 1 };
+    } finally {
+      await unlink(tmp).catch(() => undefined);
+    }
+  }
+
+  async remove(workspaceId: string, name: string): Promise<boolean> {
+    try {
+      await this.client.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: this.key(workspaceId, name) }));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async list(workspaceId: string): Promise<Array<{ name: string; bytes: number; kind: "video" | "audio" | "image" }>> {
+    if (!/^[0-9a-fA-F-]{8,64}$/.test(workspaceId)) throw new StorageError("Invalid workspace.", "invalid filename");
+    const items: Array<{ name: string; bytes: number; kind: "video" | "audio" | "image" }> = [];
+    let token: string | undefined;
+    for (;;) {
+      const page = await this.client.send(
+        new ListObjectsV2Command({ Bucket: this.bucket, Prefix: `${workspaceId}/`, MaxKeys: 1000, ContinuationToken: token })
+      );
+      for (const obj of page.Contents ?? []) {
+        const full = obj.Key ?? "";
+        const name = full.startsWith(`${workspaceId}/`) ? full.slice(workspaceId.length + 1) : "";
+        if (!validMediaName(name)) continue;
+        const kind = kindForExt(extname(name).toLowerCase());
+        if (kind) items.push({ name, bytes: obj.Size ?? 0, kind });
+      }
+      if (!page.IsTruncated) break;
+      token = page.NextContinuationToken;
+    }
+    return items.sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  stream(workspaceId: string, name: string, range?: ByteRange): NodeJS.ReadableStream {
+    const out = new PassThrough();
+    void (async () => {
+      try {
+        const response = await this.client.send(
+          new GetObjectCommand({
+            Bucket: this.bucket,
+            Key: this.key(workspaceId, name),
+            ...(range ? { Range: `bytes=${range.start}-${range.end}` } : {}),
+          })
+        );
+        const body = response.Body as unknown as AsyncIterable<Uint8Array> | undefined;
+        if (!body) {
+          out.destroy(new Error("empty s3 body"));
+          return;
+        }
+        for await (const chunk of body) {
+          if (!out.write(chunk)) await new Promise<void>((r) => out.once("drain", r));
+        }
+        out.end();
+      } catch (err) {
+        out.destroy(err as Error);
+      }
+    })();
+    return out;
+  }
+}
+
+/** Select the configured backend: S3 when fully configured, else filesystem. */
+export async function createStorageFromEnv(opts: { storageDir: string; env?: NodeJS.ProcessEnv }): Promise<MediaStorage> {
+  const env = opts.env ?? process.env;
+  const resolved = resolveS3Config(env);
+  if (resolved) {
+    const staging = join(opts.storageDir, ".spool");
+    return new S3Storage(resolved, staging);
+  }
+  return new FilesystemStorage(opts.storageDir);
 }
 
 /** Placeholder that documents the provider handoff without exposing secrets. */

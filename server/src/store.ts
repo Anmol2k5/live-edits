@@ -128,6 +128,8 @@ export interface Store {
   touchSession(id: string): Promise<void>;
   deleteSessionByHash(tokenHash: string): Promise<boolean>;
   deleteSessionsForUser(userId: string): Promise<number>;
+  listSessions(userId: string): Promise<Array<{ id: string; createdAt: number; lastSeenAt: number }>>;
+  deleteOtherSessions(userId: string, exceptId: string): Promise<number>;
   createWorkspace(name: string, ownerId: string): Promise<WorkspaceRow>;
   findWorkspace(id: string): Promise<WorkspaceRow | null>;
   listWorkspacesForUser(userId: string): Promise<Array<{ workspace: WorkspaceRow; role: Role }>>;
@@ -240,6 +242,22 @@ export class MemoryStore implements Store {
     let n = 0;
     for (const [id, row] of [...this.sessions]) {
       if (row.userId === userId) {
+        this.sessions.delete(id);
+        this.sessionsByHash.delete(row.tokenHash);
+        n += 1;
+      }
+    }
+    return n;
+  }
+  async listSessions(userId: string): Promise<Array<{ id: string; createdAt: number; lastSeenAt: number }>> {
+    return [...this.sessions.values()]
+      .filter((s) => s.userId === userId)
+      .map((s) => ({ id: s.id, createdAt: s.createdAt, lastSeenAt: s.lastSeenAt }));
+  }
+  async deleteOtherSessions(userId: string, exceptId: string): Promise<number> {
+    let n = 0;
+    for (const [id, row] of [...this.sessions]) {
+      if (row.userId === userId && id !== exceptId) {
         this.sessions.delete(id);
         this.sessionsByHash.delete(row.tokenHash);
         n += 1;
@@ -595,6 +613,19 @@ export class PostgresStore implements Store {
   }
   async deleteSessionsForUser(userId: string): Promise<number> {
     const { rows } = await this.pool.query(`DELETE FROM sessions WHERE user_id = $1 RETURNING id`, [userId]);
+    return rows.length;
+  }
+  async listSessions(userId: string): Promise<Array<{ id: string; createdAt: number; lastSeenAt: number }>> {
+    const { rows } = await this.pool.query(
+      `SELECT id::text AS id, (extract(epoch from created_at)*1000)::bigint AS "createdAt",
+              (extract(epoch from last_seen_at)*1000)::bigint AS "lastSeenAt"
+       FROM sessions WHERE user_id = $1 ORDER BY created_at`,
+      [userId]
+    );
+    return rows.map((r) => ({ id: str(r["id"]), createdAt: num(r["createdAt"]), lastSeenAt: num(r["lastSeenAt"]) }));
+  }
+  async deleteOtherSessions(userId: string, exceptId: string): Promise<number> {
+    const { rows } = await this.pool.query(`DELETE FROM sessions WHERE user_id = $1 AND id <> $2 RETURNING id`, [userId, exceptId]);
     return rows.length;
   }
   async createWorkspace(name: string, ownerId: string): Promise<WorkspaceRow> {

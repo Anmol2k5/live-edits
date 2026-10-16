@@ -53,6 +53,10 @@ test("hosted account → pack → media → overlay slice with tenant isolation"
   const app = await browser.newPage();
   try {
     await app.goto("http://localhost:1420/", { waitUntil: "networkidle" });
+    // Desktop-companion auth path (Bearer): the dashboard and the ephemeral
+    // test backend are cross-origin, so HttpOnly cookies cannot flow here.
+    // The cookie + CSRF web path is covered by server unit tests instead.
+    await app.evaluate(() => localStorage.setItem("live-edits.saas.auth-mode", "desktop"));
     await app.getByRole("button", { name: "Cloud", exact: true }).click();
     await app.getByLabel("Cloud backend URL").fill(backend.base);
 
@@ -160,6 +164,41 @@ test("hosted account → pack → media → overlay slice with tenant isolation"
       );
     } finally {
       await overlay.close();
+    }
+
+    // Reconnect: a fresh overlay page on the same session resyncs and plays.
+    const overlayAgain: Page = await browser.newPage();
+    try {
+      await overlayConnected(backend.base, overlayUrl, overlayAgain);
+      await app.bringToFront();
+      await app.getByRole("button", { name: "Fire cloud effect" }).click();
+      await expect(app.getByText(/Reaction sent to 1 hosted overlay/)).toBeAttached({ timeout: 15000 });
+      await expect(overlayAgain.locator("#stage audio")).toBeAttached({ timeout: 15000 });
+      await overlayAgain.waitForFunction(
+        () => (window as unknown as { __liveEdits?: { idle: () => boolean } }).__liveEdits?.idle() === true,
+        { timeout: 30000 }
+      );
+    } finally {
+      await overlayAgain.close();
+    }
+
+    // Rotate: the old URL dies immediately, the new one works.
+    await app.bringToFront();
+    await app.getByRole("button", { name: "Rotate", exact: true }).click();
+    await expect(app.getByText(/token rotated/i)).toBeAttached({ timeout: 15000 });
+    const rotatedUrl = (await urlLocator.first().textContent())?.trim() ?? "";
+    expect(rotatedUrl).toBeTruthy();
+    expect(rotatedUrl).not.toBe(overlayUrl);
+    expect(await fetch(overlayUrl).then((r) => r.status)).toBe(403);
+    const overlayRotated: Page = await browser.newPage();
+    try {
+      await overlayConnected(backend.base, rotatedUrl, overlayRotated);
+      await app.bringToFront();
+      await app.getByRole("button", { name: "Fire cloud effect" }).click();
+      await expect(app.getByText(/Reaction sent to 1 hosted overlay/)).toBeAttached({ timeout: 15000 });
+      await expect(overlayRotated.locator("#stage audio")).toBeAttached({ timeout: 15000 });
+    } finally {
+      await overlayRotated.close();
     }
 
     // Other workspace cannot access this one (tenant isolation over HTTP).

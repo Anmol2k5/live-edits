@@ -3,20 +3,98 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createSaasApp } from "./app.ts";
-import { MemoryStore } from "./store.ts";
-import { FilesystemStorage } from "./storage.ts";
+import { MemoryStore, PostgresStore, type Store } from "./store.ts";
+import { FilesystemStorage, S3Storage, type MediaStorage } from "./storage.ts";
+import { InMemoryEmailProvider } from "./email.ts";
 
 export interface TestApp {
   base: string;
   close: () => Promise<void>;
 }
 
-export async function startTestApp(): Promise<TestApp & { secret: string }> {
-  const storage = new FilesystemStorage(mkdtempSync(join(tmpdir(), "saas-media-")));
+function testDsn(): string {
+  return process.env["SAAS_TEST_DSN"] || "postgres://postgres@127.0.0.1:5433/postgres";
+}
+
+async function testStore(): Promise<{ store: Store; cleanup: () => Promise<void> }> {
+  if ((process.env["SAAS_TEST_BACKEND"] ?? "memory") !== "postgres") {
+    return { store: new MemoryStore(), cleanup: async () => undefined };
+  }
+  // Fresh isolated database per app instance (real PostgreSQL). Retries ride
+  // out transient recovery windows on constrained hosts.
+  const { Client } = await import("pg");
+  const dbName = `saas_t_${Date.now().toString(36)}_${Math.floor(Math.random() * 1e6).toString(36)}`.replace(/[^a-z0-9_]/g, "_");
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      const admin = new Client({ connectionString: testDsn() });
+      await admin.connect();
+      try {
+        await admin.query(`CREATE DATABASE "${dbName}"`);
+      } finally {
+        await admin.end();
+      }
+      const store = await PostgresStore.connect(`${testDsn().replace(/\/[^/]*$/, "")}/${dbName}`);
+      return {
+        store,
+        cleanup: async () => {
+          await store.close();
+          const killer = new Client({ connectionString: testDsn() });
+          await killer.connect();
+          try {
+            await killer.query(`DROP DATABASE "${dbName}"`);
+          } finally {
+            await killer.end();
+          }
+        },
+      };
+    } catch (err) {
+      lastError = err;
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  }
+  throw lastError;
+}
+
+async function testStorage(): Promise<{ storage: MediaStorage; cleanup: () => Promise<void> }> {
+  if ((process.env["SAAS_TEST_S3"] ?? "") !== "1") {
+    const storage = new FilesystemStorage(mkdtempSync(join(tmpdir(), "saas-media-")));
+    await storage.init();
+    return { storage, cleanup: async () => undefined };
+  }
+  // Real S3-compatible service (MinIO/moto_server); bucket per instance.
+  const endpoint = process.env["SAAS_TEST_S3_ENDPOINT"] || "http://127.0.0.1:5001";
+  const bucket = `t-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`.toLowerCase().replace(/[^a-z0-9-]/g, "-");
+  const storage = new S3Storage(
+    {
+      endpoint,
+      region: "us-east-1",
+      bucket,
+      accessKeyId: process.env["SAAS_TEST_S3_KEY"] || "test",
+      secretAccessKey: process.env["SAAS_TEST_S3_SECRET"] || "test",
+      forcePathStyle: true,
+    },
+    mkdtempSync(join(tmpdir(), "saas-spool-"))
+  );
   await storage.init();
-  const app = createSaasApp({ store: new MemoryStore(), storage, secret: "test-secret-0123456789abcdef" });
+  return { storage, cleanup: async () => undefined };
+}
+
+export async function startTestApp(opts: { email?: InMemoryEmailProvider } = {}): Promise<TestApp & { secret: string; email: InMemoryEmailProvider }> {
+  const { store, cleanup: dropStore } = await testStore();
+  const { storage } = await testStorage();
+  const email = opts.email ?? new InMemoryEmailProvider();
+  const app = createSaasApp({ store, storage, secret: "test-secret-0123456789abcdef", email });
   const { base } = await app.listen(0);
-  return { base, secret: app.secret, close: () => app.close() };
+  return {
+    base,
+    secret: app.secret,
+    email,
+    close: async () => {
+      await app.close();
+      await dropStore();
+    },
+  };
 }
 
 export async function api(base: string, method: string, path: string, token?: string, body?: unknown, extraHeaders?: Record<string, string>): Promise<{ status: number; json: unknown }> {

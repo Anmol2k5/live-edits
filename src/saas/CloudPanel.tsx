@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   saasApi,
   SaasError,
+  getAuthMode,
   loadSaasBase,
   saveSaasBase,
   loadSaasToken,
@@ -45,11 +46,19 @@ function messageOf(err: unknown): string {
 export function CloudPanel(props: CloudPanelProps): React.JSX.Element {
   const { library, onLoadCloudPack } = props;
   const [base, setBase] = useState(() => loadSaasBase());
-  const [token, setToken] = useState(() => loadSaasToken());
+  // Desktop (Tauri) sessions persist a Bearer token as the secure-store
+  // stand-in; web sessions live in the HttpOnly cookie and start empty.
+  const [token, setToken] = useState(() => (getAuthMode() === "desktop" ? loadSaasToken() : ""));
   const [userEmail, setUserEmail] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [authNote, setAuthNote] = useState<string | null>(null);
+  const [recoverEmail, setRecoverEmail] = useState("");
+  const [recoverToken, setRecoverToken] = useState("");
+  const [recoverPassword, setRecoverPassword] = useState("");
+  const [recoverNote, setRecoverNote] = useState<string | null>(null);
+  const [sessions, setSessions] = useState<Array<{ id: string; current: boolean }>>([]);
+  const [sessionNote, setSessionNote] = useState<string | null>(null);
   const [workspaces, setWorkspaces] = useState<Array<{ id: string; name: string; role: string; activePackUid: string | null }>>([]);
   const [workspaceId, setWorkspaceId] = useState(() => loadSaasWorkspace());
   const [newWorkspace, setNewWorkspace] = useState("");
@@ -139,6 +148,7 @@ export function CloudPanel(props: CloudPanelProps): React.JSX.Element {
       // Session may already be gone; still clear locally.
     }
     setToken("");
+    saveSaasToken("");
     setUserEmail("");
     setWorkspaces([]);
     setWorkspaceId("");
@@ -146,7 +156,52 @@ export function CloudPanel(props: CloudPanelProps): React.JSX.Element {
     setMedia([]);
     setOverlays([]);
     setOverlayTokens({});
+    setSessions([]);
     setAuthNote("Signed out.");
+  }, [base, token]);
+
+  const handleRecoverRequest = useCallback(async () => {
+    setRecoverNote(null);
+    try {
+      await saasApi.recoverRequest(base, recoverEmail.trim());
+      setRecoverNote("If that address has an account, a reset link is on its way.");
+    } catch (err) {
+      setRecoverNote(messageOf(err));
+    }
+  }, [base, recoverEmail]);
+
+  const handleRecoverConfirm = useCallback(async () => {
+    setRecoverNote(null);
+    try {
+      await saasApi.recoverConfirm(base, recoverToken.trim(), recoverPassword);
+      setRecoverToken("");
+      setRecoverPassword("");
+      setRecoverNote("Password reset — sign in with the new password.");
+    } catch (err) {
+      setRecoverNote(messageOf(err));
+    }
+  }, [base, recoverToken, recoverPassword]);
+
+  const handleRefreshSessions = useCallback(async () => {
+    setSessionNote(null);
+    try {
+      const res = await saasApi.listSessions(base, token);
+      setSessions(res.sessions);
+    } catch (err) {
+      setSessionNote(messageOf(err));
+    }
+  }, [base, token]);
+
+  const handleRevokeOthers = useCallback(async () => {
+    setSessionNote(null);
+    try {
+      await saasApi.revokeOtherSessions(base, token);
+      const res = await saasApi.listSessions(base, token);
+      setSessions(res.sessions);
+      setSessionNote("Other sessions signed out.");
+    } catch (err) {
+      setSessionNote(messageOf(err));
+    }
   }, [base, token]);
 
   const handleCreateWorkspace = useCallback(async () => {
@@ -359,7 +414,13 @@ export function CloudPanel(props: CloudPanelProps): React.JSX.Element {
             <p className="editor-hint">Signed in{userEmail ? ` as ${userEmail}` : ""}. Sessions expire after 7 days; sign in again afterwards.</p>
             <div className="editor-row">
               <button type="button" onClick={() => void handleLogout()}>Sign out</button>
+              <button type="button" onClick={() => void handleRefreshSessions()}>List sessions</button>
+              <button type="button" onClick={() => void handleRevokeOthers()}>Sign out other devices</button>
             </div>
+            {sessions.length > 0 && (
+              <p className="editor-hint">{sessions.length} active session{sessions.length === 1 ? "" : "s"} (this device marked current).</p>
+            )}
+            {sessionNote && <p className="editor-status" role="status">{sessionNote}</p>}
           </>
         ) : (
           <>
@@ -375,9 +436,32 @@ export function CloudPanel(props: CloudPanelProps): React.JSX.Element {
               <button type="button" onClick={() => void handleLogin()}>Sign in</button>
               <button type="button" onClick={() => void handleRegister()}>Register</button>
             </div>
+            <details>
+              <summary>Forgot password?</summary>
+              <label>
+                Account email
+                <input aria-label="Recovery email" value={recoverEmail} onChange={(e) => setRecoverEmail(e.target.value)} placeholder="you@example.com" autoComplete="email" />
+              </label>
+              <div className="editor-row">
+                <button type="button" onClick={() => void handleRecoverRequest()} disabled={!recoverEmail.trim()}>Send reset link</button>
+              </div>
+              <label>
+                Reset token (from email)
+                <input aria-label="Recovery token" value={recoverToken} onChange={(e) => setRecoverToken(e.target.value)} placeholder="Paste the emailed token" />
+              </label>
+              <label>
+                New password (10+ characters)
+                <input aria-label="Recovery new password" type="password" value={recoverPassword} onChange={(e) => setRecoverPassword(e.target.value)} autoComplete="new-password" />
+              </label>
+              <div className="editor-row">
+                <button type="button" onClick={() => void handleRecoverConfirm()} disabled={!recoverToken.trim() || !recoverPassword}>Reset password</button>
+              </div>
+            </details>
           </>
         )}
         {authNote && <p className="editor-status" role="status">{authNote}</p>}
+        {recoverNote && <p className="editor-status" role="status">{recoverNote}</p>}
+        <p className="editor-hint">Web sign-in uses an HttpOnly cookie (+ CSRF); the desktop companion uses a separate Bearer token.</p>
       </section>
 
       {authed && (

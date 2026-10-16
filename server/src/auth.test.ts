@@ -61,18 +61,20 @@ describe("saas auth (M7)", () => {
     }
   });
 
-  it("supports recovery with single-use expiring tokens", async () => {
+  it("supports recovery with single-use expiring tokens delivered by email", async () => {
     const app = await startTestApp();
     try {
       await register(app.base, "rec@example.com");
       const req = await api(app.base, "POST", "/api/auth/recover/request", undefined, { email: "rec@example.com" });
       expect(req.status).toBe(200);
-      const token = (req.json as { resetToken?: string }).resetToken;
+      // Tokens never appear in API responses; they travel by email only.
+      expect((req.json as { resetToken?: string }).resetToken).toBeUndefined();
+      const token = app.email.tokenFor("rec@example.com");
       expect(token).toBeTruthy();
       // Unknown addresses still return ok (no enumeration).
       const ghost = await api(app.base, "POST", "/api/auth/recover/request", undefined, { email: "ghost@example.com" });
       expect(ghost.status).toBe(200);
-      expect((ghost.json as { resetToken?: string }).resetToken).toBeUndefined();
+      expect(app.email.tokenFor("ghost@example.com")).toBeNull();
 
       const confirm = await api(app.base, "POST", "/api/auth/recover/confirm", undefined, { token, newPassword: "recovered-pass-77" });
       expect(confirm.status).toBe(200);
