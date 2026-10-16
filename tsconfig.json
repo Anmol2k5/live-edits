@@ -20,6 +20,6 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src", "tests/e2e", "shared/scheduler-cases.json"],
+  "include": ["src", "server", "tests/e2e", "shared/scheduler-cases.json"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

@@ -1,5 +1,25 @@
 # Changelog
 
+## M7 — Hosted SaaS foundation (branch feature/obs-reaction-mvp)
+
+Scope: account → pack → media → overlay vertical slice only. No Twitch, no billing, no merge of PR #1, no deploy, no release claim. Local Tauri app, loopback relay, packs, editor, triggers, and playback are preserved and still fully tested.
+
+### Backend (`server/`, zero new runtime deps)
+
+- `createSaasApp`: auth (register/login/logout, scrypt passwords, opaque 7-day sessions over cookie + Bearer, single-use expiring recovery, account settings), workspaces with owner/admin/member roles and membership-checked routes (unknown/non-member → 404, denied attempts audited), versioned pack CRUD + collision-safe import/export byte-compatible with local JSON, streaming workspace media (allowlist, 50 MB, magic-byte sniff, atomic rename, 409 duplicates, versioned replace, quotas, signed URLs), named/revocable/rotatable overlay sessions with workspace-isolated SSE plus trigger validation (expiry/dedup/media/effect resolution through the active pack), history + audit. `npm run saas`.
+- Persistence: `server/migrations/001_init.sql` (Postgres 15+, all entities, constraints, indexes); `MemoryStore` mirrors every constraint for tests/dev; `PostgresStore` loads `pg` only when `DATABASE_URL` is set (not verified here — no server available; documented in `docs/SAAS_ARCHITECTURE.md`).
+- Storage: `FilesystemStorage` (tests/dev, temp dirs in tests) + S3-compatible config from `LIVE_EDITS_S3_*` with credentials server-side only (config path tested; byte-level S3 NOT verified).
+- Hosted overlay page reuses the shared scheduler core and queue/coexist/expiry/dedup semantics; local relay untouched (still loopback-only, never exposed publicly).
+
+### Dashboard (`src/saas/`, Cloud view in `src/App.tsx`)
+
+- Sign in/register/recovery-aware account panel, workspace create/select, cloud packs (create, save-local-to-cloud, load-into-editor round-trip, activate, delete), cloud media upload/inventory/delete, overlay create/copy-URL/revoke/rotate, fire-by-effect with delivery status. Local Live/Editor flows unchanged.
+
+### Verification (actual runs, this environment)
+
+- `npm run typecheck` clean; `npm run test` green (incl. 6 new server suites: auth/workspaces/packs/media/overlays/security + CloudPanel render); `npm run test:relay` green; `npm run test:e2e` green incl. new `saas.spec.ts` (real backend on ephemeral port, real Chromium: register → workspace → pack → upload → configure → overlay → trigger plays on correct overlay → rival isolated → revoke → reload keeps packs); `npm run build` success; `npm audit` 0 vulnerabilities.
+- NOT verified here: production Postgres run, byte-level S3, physical OBS/webcam, Tauri packaging, long soak — gates stay open.
+
 ## M6.1 — Finish the reaction-pack workflow (branch feature/obs-reaction-mvp)
 
 Scope: master-prompt Milestone 6.1 only (recovered after an interrupted session; no restart from scratch). No merge of PR #1, no deploy, no SaaS/billing/Twitch, no release claim.

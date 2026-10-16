@@ -29,7 +29,7 @@ export default defineConfig({
       // headless run can verify (see docs/OBS_SETUP.md for the manual
       // audible check).
       name: "playback",
-      testMatch: /(overlay|editor)\.spec\.ts/,
+      testMatch: /(overlay|editor|saas)\.spec\.ts/,
       use: {
         browserName: "chromium",
         channel: "chrome",

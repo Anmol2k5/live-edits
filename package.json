@@ -12,6 +12,7 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "relay": "node scripts/overlay-relay.mjs",
+    "saas": "node server/src/index.ts",
     "test:relay": "node --test scripts/overlay-relay.test.mjs scripts/scheduler-conformance.test.mjs",
     "test:e2e": "playwright test"
   },

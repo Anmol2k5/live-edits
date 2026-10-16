@@ -11,6 +11,7 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 import { TriggerConsole } from "./console/TriggerConsole";
 import { RelayPanel, DEFAULT_RELAY_BASE } from "./relay/RelayPanel";
 import { ReactionEditor } from "./editor/ReactionEditor";
+import { CloudPanel } from "./saas/CloudPanel";
 import { MediaRegistry } from "./editor/mediaLibrary";
 import {
   loadLibrary,
@@ -22,6 +23,10 @@ import {
   findAssignment,
   resolveTemplateTrigger,
 } from "./packs/resolve";
+import {
+  importPack as importLocalPack,
+  parsePack as parseLocalPack,
+} from "./packs/packSchemas";
 import type { AnyEffect } from "./effects/effectSchemas";
 import type { ReactionPack } from "./packs/packSchemas";
 import {
@@ -32,7 +37,7 @@ import {
 } from "./trigger/triggerSchemas";
 import type { TriggerSource } from "./trigger/triggerSchemas";
 
-type View = "live" | "editor";
+type View = "live" | "editor" | "cloud";
 
 /** Template identity + source for button-style triggers (all sources). */
 function templateOf(input: AnyTrigger): {
@@ -66,6 +71,25 @@ export default function App() {
     saveLibrary(next);
     setLibrary(loadLibrary());
   }, []);
+
+  // Cloud packs share the local JSON shape: loading one imports it into the
+  // local library collision-safe so the visual editor can edit assignments,
+  // then CloudPanel saves the local pack back to the workspace.
+  const handleLoadCloudPack = useCallback((data: unknown): { ok: boolean; message: string } => {
+    try {
+      const parsed = parseLocalPack(data);
+      const current = loadLibrary();
+      const imported = importLocalPack(parsed, {
+        packIds: new Set(current.packs.map((p) => p.id)),
+        effectIds: new Set(current.packs.flatMap((p) => p.effects.map((e) => e.id))),
+      });
+      const next: PackLibrary = { version: 1, packs: [...current.packs, imported], activePackId: current.activePackId };
+      handleLibraryChange(next);
+      return { ok: true, message: `Loaded "${imported.name}" into the Editor.` };
+    } catch (err) {
+      return { ok: false, message: err instanceof Error ? err.message : String(err) };
+    }
+  }, [handleLibraryChange]);
 
   const activePack = getActivePack(library);
 
@@ -259,6 +283,14 @@ export default function App() {
           >
             Editor
           </button>
+          <button
+            type="button"
+            onClick={() => setView("cloud")}
+            aria-pressed={view === "cloud"}
+            className={view === "cloud" ? "app__nav--current" : undefined}
+          >
+            Cloud
+          </button>
         </nav>
         <div className="app__status">
           {modelsError ? (
@@ -282,7 +314,17 @@ export default function App() {
         </div>
       )}
 
-      {view === "editor" ? (
+      {view === "cloud" ? (
+        <main className="app__main app__main--editor">
+          <ErrorBoundary>
+            <CloudPanel
+              library={library}
+              onLibraryChange={handleLibraryChange}
+              onLoadCloudPack={handleLoadCloudPack}
+            />
+          </ErrorBoundary>
+        </main>
+      ) : view === "editor" ? (
         <main className="app__main app__main--editor">
           <ErrorBoundary>
             <ReactionEditor

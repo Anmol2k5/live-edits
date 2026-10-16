@@ -34,12 +34,26 @@ triggers first. Full guide: `docs/EDITOR.md`. Audible output is only ever
 claimed after the manual check in `docs/OBS_SETUP.md` — automated tests
 assert play *permission* (`paused === false`), never heard sound.
 
+## Hosted workspaces (M7 foundation, opt-in)
+
+The **Cloud** tab talks to the SaaS backend (`npm run saas`, default
+`http://127.0.0.1:4290`) while Live/Editor keep working offline with no
+backend. Register/sign in, create a workspace, save local packs to the
+account, upload media to private per-workspace storage, create a hosted
+overlay session and copy its OBS URL, then fire effects into that
+workspace's overlays only. Cloud packs load back into the visual editor
+collision-free. Tests use an ephemeral backend + temp storage (no external
+providers); production uses `DATABASE_URL` (Postgres, see
+`server/migrations/001_init.sql`) and optional `LIVE_EDITS_S3_*` object
+storage. Details: `docs/SAAS_ARCHITECTURE.md`, `docs/SAAS_SECURITY.md`.
+
 ## Checks
 
 - `npm run typecheck` — TypeScript (app + e2e + shared fixtures)
 - `npm run test` — Vitest unit + jsdom browser-engine tests
 - `npm run test:relay` — Node relay tests + shared scheduler conformance
-- `npm run test:e2e` — Playwright real-Chromium tests: `playback` project (overlay suite + editor→OBS workflow) and `autoplay-default` project (graceful refusal, never an audibility claim). Needs system Chrome or `playwright install`; point TEMP at a writable disk if C: is full
+- `npm run test:e2e` — Playwright real-Chromium tests: `playback` project (overlay suite + editor→OBS workflow + hosted SaaS slice) and `autoplay-default` project (graceful refusal, never an audibility claim). Needs system Chrome or `playwright install`; point TEMP at a writable disk if C: is full
+- `npm run saas` — hosted SaaS backend (needs no extra deps for memory store + filesystem storage; Postgres via `DATABASE_URL` + `pg`, S3 via `LIVE_EDITS_S3_*`)
 - `npm run build` — frontend production build
 - `npm run tauri build` — desktop packaging (requires Rust and desktop toolchain)
 - `npm audit` — dependency audit (currently 0 vulnerabilities)

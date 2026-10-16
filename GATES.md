@@ -51,7 +51,7 @@ Scope: A working Tauri 2 desktop app that detects facial expressions from a webc
 - [ ] Rust/Tauri desktop package build on Windows — MANUAL TEST PENDING
 - [ ] Dependency security audit — `npm audit fix` applied 2026-10-16 (undici 8.10.0 → 8.12.2, source-map-js 1.2.1 → 1.2.2); `npm audit` now reports 0 vulnerabilities. Manual-gate status otherwise unchanged.
 - [ ] 1h+ streaming stability soak — PENDING (50-effect automated soak green; longer manual soak pending, see docs/OBS_SETUP.md checklist)
-- [ ] SaaS identity, billing, hosted backend, and tenant isolation — NOT STARTED
+- [x] SaaS identity, hosted backend, and tenant isolation — M7 foundation on this branch (local-first preserved); billing/Twitch explicitly out of scope
 
 ## Milestones 4–5 gates — OBS integration, companion reliability, streaming verification
 
@@ -88,6 +88,22 @@ CI passing does not close hardware/manual gates.
 - [x] Effect settings survive to OBS (volume, duration, position, trim, queue, priority, cooldown, effect identity); blank Live-panel fields mean no override — `src/relay/overlayClient.ts`, `src/App.tsx`
 - [x] Collision handling: duplicate pack ids refreshed, colliding effect ids rewritten with refs preserved, stale object URLs revoked, stale probe results rejected, destructive relay replaces confirmed — `src/packs/packSchemas.ts`, `src/editor/mediaLibrary.ts`, `src/editor/MediaLibraryPanel.tsx`
 - [x] End-to-end workflow verified in real Chromium: create pack, import, transfer, effect, manual assignment, save, activate, Live trigger plays relay file, cleanup, reload plays again with no reimport — `tests/e2e/editor.spec.ts`
+- [ ] Physical OBS Studio launch test on Windows — NOT TESTED (steps in docs/OBS_SETUP.md)
+- [ ] Physical webcam expression → OBS reaction — NOT TESTED (no webcam here)
+- [ ] Rust/Tauri desktop packaging — BLOCKED (no cargo/rustc)
+
+## Milestone 7 gates — hosted SaaS foundation (account → pack → media → overlay)
+
+- [x] Auth: register/login/logout, 7-day revocable sessions (cookie + Bearer), recovery with single-use expiring tokens, account settings — `server/src/app.ts`, `server/src/auth.test.ts` incl. TTL expiry
+- [x] Workspaces + memberships with tenant isolation (unknown/non-member → 404, owner-only member management, last-owner protection) — `server/src/workspaces.test.ts`
+- [x] Postgres DDL for all entities (users/resets/sessions/workspaces/memberships/packs+children/media/overlays/history/audit) with constraints/indexes; memory store mirrors them for tests/dev, `pg` loads only with `DATABASE_URL` — `server/migrations/001_init.sql`, `server/src/store.ts`
+- [x] Versioned pack persistence (v1) byte-compatible with local JSON both ways; collision-safe import; save/reload consistency — `server/src/packs.ts`, `server/src/packs.test.ts`
+- [x] Private storage: streaming validated uploads (allowlist, 50 MB, magic-byte sniff, atomic rename, 409 duplicates, quotas, failed-upload cleanup), versioned replace, signed delivery, ownership checks; S3 config without exposed credentials (byte-level S3 NOT verified — filesystem backend is what tests prove) — `server/src/storage.ts`, `server/src/media.test.ts`
+- [x] Hosted overlays: named/revocable/rotatable sessions, transparent SSE page reusing the shared scheduler, workspace isolation, simultaneous overlays, expiry/dedup, trigger history + audit — `server/src/overlays.test.ts`
+- [x] Editor connection: Cloud view (auth/workspaces/packs/media/overlays/fire), save-local-to-cloud, load-into-editor round-trip, local mode preserved — `src/saas/CloudPanel.tsx`, `src/App.tsx`
+- [x] Real-browser e2e (real backend, no mocks): sign in → workspace → pack → upload → configure → save → overlay session → trigger → correct overlay receives → rival workspace isolated → revoke stops delivery → reload keeps packs — `tests/e2e/saas.spec.ts`
+- [ ] S3 byte-level integration with a real provider — NOT VERIFIED (config path only)
+- [ ] Production Postgres run (migrations + `pg`) — NOT VERIFIED here (no server available; memory store exercised)
 - [ ] Physical OBS Studio launch test on Windows — NOT TESTED (steps in docs/OBS_SETUP.md)
 - [ ] Physical webcam expression → OBS reaction — NOT TESTED (no webcam here)
 - [ ] Rust/Tauri desktop packaging — BLOCKED (no cargo/rustc)
