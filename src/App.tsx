@@ -9,13 +9,47 @@ import { MomentDebugBar } from "./components/MomentDebugBar";
 import { EditOverlay } from "./components/EditOverlay";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { TriggerConsole } from "./console/TriggerConsole";
-import { RelayPanel } from "./relay/RelayPanel";
-import { createMomentTrigger, createTemplateTrigger } from "./trigger/triggerSchemas";
+import { RelayPanel, DEFAULT_RELAY_BASE } from "./relay/RelayPanel";
+import { ReactionEditor } from "./editor/ReactionEditor";
+import { MediaRegistry } from "./editor/mediaLibrary";
+import {
+  loadLibrary,
+  saveLibrary,
+  getActivePack,
+  type PackLibrary,
+} from "./packs/packStore";
+import { resolveMomentToEffect } from "./packs/resolve";
+import type { AnyEffect } from "./effects/effectSchemas";
+import type { ReactionPack } from "./packs/packSchemas";
+import {
+  createEffectTrigger,
+  createMomentTrigger,
+  createTemplateTrigger,
+} from "./trigger/triggerSchemas";
+
+type View = "live" | "editor";
 
 export default function App() {
   const { state: cameraState, restart } = useCamera();
   const viewfinderRef = useRef<ViewfinderHandle>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const [view, setView] = useState<View>("live");
+
+  // Reaction packs (M6). Persisted as validated JSON without binaries.
+  const [library, setLibrary] = useState<PackLibrary>(() => loadLibrary());
+  const [, setMediaVersion] = useState(0);
+  const mediaRef = useRef<MediaRegistry | null>(null);
+  if (!mediaRef.current) {
+    mediaRef.current = new MediaRegistry();
+  }
+  const media = mediaRef.current;
+
+  const handleLibraryChange = useCallback((next: PackLibrary) => {
+    saveLibrary(next);
+    setLibrary(loadLibrary());
+  }, []);
+
+  const activePack = getActivePack(library);
 
   // Keep videoRef synced with the viewfinder's video element. Runs after
   // every render on purpose: the <video> element only exists once the
@@ -39,34 +73,52 @@ export default function App() {
   } = useMomentDetector(videoRef, isActive);
 
   const { currentEdit, composeError, fireTrigger, dismiss, save } = useEditPipeline();
+  const [relayBase, setRelayBase] = useState(DEFAULT_RELAY_BASE);
   const [relayToken, setRelayToken] = useState("");
   const [mediaFile, setMediaFile] = useState("");
   const [volume, setVolume] = useState("1");
   const [durationMs, setDurationMs] = useState("");
   const [relayStatus, setRelayStatus] = useState("Not connected");
 
-  const publishToOverlay = useCallback((event: PublishableTrigger) => {
-    if (!relayToken.trim()) return;
-    const parsedVolume = Number(volume);
-    const parsedDuration = Number(durationMs);
-    void publishOverlayTrigger(event, relayToken.trim(), {
-      mediaFile,
-      ...(Number.isFinite(parsedVolume) ? { volume: Math.min(1, Math.max(0, parsedVolume)) } : {}),
-      ...(Number.isInteger(parsedDuration) && parsedDuration > 0 ? { durationMs: parsedDuration } : {}),
-    })
-      .then((clients) => setRelayStatus(
-        clients ? "Reaction sent to " + clients + " OBS overlay(s)" : "Event accepted; no OBS overlay connected"
-      ))
-      .catch((error: unknown) => setRelayStatus("Relay unavailable: " + String(error)));
-  }, [relayToken, mediaFile, volume, durationMs]);
+  const publishToOverlay = useCallback(
+    (event: PublishableTrigger) => {
+      if (!relayToken.trim()) return;
+      const parsedVolume = Number(volume);
+      const parsedDuration = Number(durationMs);
+      void publishOverlayTrigger(event, relayToken.trim(), {
+        mediaFile,
+        ...(Number.isFinite(parsedVolume) ? { volume: Math.min(1, Math.max(0, parsedVolume)) } : {}),
+        ...(Number.isInteger(parsedDuration) && parsedDuration > 0 ? { durationMs: parsedDuration } : {}),
+      }, activePack, relayBase)
+        .then((clients) => setRelayStatus(
+          clients ? "Reaction sent to " + clients + " OBS overlay(s)" : "Event accepted; no OBS overlay connected"
+        ))
+        .catch((error: unknown) => setRelayStatus("Relay unavailable: " + String(error)));
+    },
+    [relayToken, mediaFile, volume, durationMs, activePack, relayBase]
+  );
 
-  // Wire detector events to the shared pipeline. The event stays pending
-  // until a video frame is available, so a trigger is never silently lost
-  // when the preview mounts a beat later. The validated contract exercises
-  // the same path the overlay relay uses.
+  // Detector path: pack assignments win for the local preview; a pack media
+  // effect skips PNG composition (nothing to composite) but still publishes
+  // so OBS plays the configured effect.
   useEffect(() => {
     if (!lastEvent) return;
+    const resolved = resolveMomentToEffect(
+      lastEvent.moment,
+      "ai-detector",
+      activePack
+    );
     const video = videoRef.current;
+    if (resolved && resolved.kind !== "frame") {
+      publishToOverlay(
+        createEffectTrigger(resolved.id, {
+          source: "ai-detector",
+          timestamp: lastEvent.at,
+        })
+      );
+      clearLastEvent();
+      return;
+    }
     if (!video) return;
 
     const event = createMomentTrigger(lastEvent.moment, {
@@ -74,10 +126,10 @@ export default function App() {
       confidence: lastEvent.confidence,
       timestamp: lastEvent.at,
     });
-    fireTrigger(video, event);
+    fireTrigger(video, event, activePack);
     publishToOverlay(event);
     clearLastEvent();
-  }, [lastEvent, fireTrigger, publishToOverlay, clearLastEvent]);
+  }, [lastEvent, fireTrigger, publishToOverlay, clearLastEvent, activePack]);
 
   const handleManualTrigger = useCallback(
     (event: AnyTrigger) => {
@@ -85,11 +137,11 @@ export default function App() {
       // relay publish below works without any webcam.
       const video = videoRef.current;
       if (hasValidFrame(video)) {
-        fireTrigger(video as HTMLVideoElement, event);
+        fireTrigger(video as HTMLVideoElement, event, activePack);
       }
       publishToOverlay(event);
     },
-    [fireTrigger, publishToOverlay]
+    [fireTrigger, publishToOverlay, activePack]
   );
 
   // One-click end-to-end check: a validated contract trigger straight to
@@ -99,6 +151,27 @@ export default function App() {
       createTemplateTrigger("wow-1", { source: "manual" })
     );
   }, [publishToOverlay]);
+
+  // Editor fires a pack effect straight at the relay with its full config.
+  // The draft pack travels explicitly: unsaved edits still fire exactly
+  // what the preview renders.
+  const handleFireEffect = useCallback(
+    (effect: AnyEffect, pack: ReactionPack) => {
+      if (!relayToken.trim()) return;
+      void publishOverlayTrigger(
+        createEffectTrigger(effect.id, { source: "manual" }),
+        relayToken.trim(),
+        {},
+        pack,
+        relayBase
+      )
+        .then((clients) => setRelayStatus(
+          clients ? "Reaction sent to " + clients + " OBS overlay(s)" : "Event accepted; no OBS overlay connected"
+        ))
+        .catch((error: unknown) => setRelayStatus("Relay unavailable: " + String(error)));
+    },
+    [relayToken, relayBase]
+  );
 
   // Manual OBS triggers stay available without a webcam once a relay token
   // is configured; the local PNG preview still needs the camera.
@@ -111,6 +184,24 @@ export default function App() {
           <span className="app__title-icon">🎬</span>
           Streamer Moment Overlay
         </h1>
+        <nav className="app__nav" aria-label="Views">
+          <button
+            type="button"
+            onClick={() => setView("live")}
+            aria-pressed={view === "live"}
+            className={view === "live" ? "app__nav--current" : undefined}
+          >
+            Live
+          </button>
+          <button
+            type="button"
+            onClick={() => setView("editor")}
+            aria-pressed={view === "editor"}
+            className={view === "editor" ? "app__nav--current" : undefined}
+          >
+            Editor
+          </button>
+        </nav>
         <div className="app__status">
           {modelsError ? (
             <span className="app__status-badge app__status-badge--loading" title={modelsError} role="alert">AI Error</span>
@@ -133,43 +224,62 @@ export default function App() {
         </div>
       )}
 
-      <main className="app__main">
-        <ErrorBoundary>
-          <Viewfinder
-            ref={viewfinderRef}
-            cameraState={cameraState}
-            onRetry={restart}
-          />
-        </ErrorBoundary>
-
-        {currentEdit && (
+      {view === "editor" ? (
+        <main className="app__main app__main--editor">
           <ErrorBoundary>
-            <EditOverlay
-              edit={currentEdit}
-              onDismiss={dismiss}
-              onSave={save}
+            <ReactionEditor
+              library={library}
+              onLibraryChange={handleLibraryChange}
+              media={media}
+              onMediaChange={() => setMediaVersion((v) => v + 1)}
+              relayReady={relayToken.trim().length > 0}
+              onFireEffect={handleFireEffect}
             />
           </ErrorBoundary>
-        )}
-      </main>
+        </main>
+      ) : (
+        <>
+          <main className="app__main">
+            <ErrorBoundary>
+              <Viewfinder
+                ref={viewfinderRef}
+                cameraState={cameraState}
+                onRetry={restart}
+              />
+            </ErrorBoundary>
 
-      <TriggerConsole
-        onTrigger={handleManualTrigger}
-        disabled={consoleDisabled}
-      />
-      <RelayPanel
-        relayToken={relayToken}
-        setRelayToken={setRelayToken}
-        mediaFile={mediaFile}
-        setMediaFile={setMediaFile}
-        volume={volume}
-        setVolume={setVolume}
-        durationMs={durationMs}
-        setDurationMs={setDurationMs}
-        relayStatus={relayStatus}
-        cameraActive={isActive}
-        onTestReaction={handleTestReaction}
-      />
+            {currentEdit && (
+              <ErrorBoundary>
+                <EditOverlay
+                  edit={currentEdit}
+                  onDismiss={dismiss}
+                  onSave={save}
+                />
+              </ErrorBoundary>
+            )}
+          </main>
+
+          <TriggerConsole
+            onTrigger={handleManualTrigger}
+            disabled={consoleDisabled}
+          />
+          <RelayPanel
+            relayBase={relayBase}
+            setRelayBase={setRelayBase}
+            relayToken={relayToken}
+            setRelayToken={setRelayToken}
+            mediaFile={mediaFile}
+            setMediaFile={setMediaFile}
+            volume={volume}
+            setVolume={setVolume}
+            durationMs={durationMs}
+            setDurationMs={setDurationMs}
+            relayStatus={relayStatus}
+            cameraActive={isActive}
+            onTestReaction={handleTestReaction}
+          />
+        </>
+      )}
 
       <MomentDebugBar
         scores={scores}

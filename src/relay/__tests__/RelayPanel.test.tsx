@@ -4,6 +4,8 @@ import { RelayPanel } from "../RelayPanel";
 
 describe("RelayPanel (M4/M5 setup workflow)", () => {
   const props = {
+    relayBase: "http://127.0.0.1:4190",
+    setRelayBase: vi.fn(),
     relayToken: "",
     setRelayToken: vi.fn(),
     mediaFile: "",

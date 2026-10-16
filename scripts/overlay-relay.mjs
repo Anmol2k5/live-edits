@@ -44,11 +44,10 @@ function parseTrigger(input){
   if(!input||typeof input!=="object"||!MOMENTS.has(input.moment))return null;
   let templateId=input.templateId??input.moment+"-1";
   if(input.effectId!==undefined){
-    if(!optString(input.effectId,1,128)||!input.effectId.startsWith("effect-"))return null;
-    const implied=input.effectId.slice("effect-".length);
-    if(!TEMPLATES.has(implied))return null;
-    if(input.templateId!==undefined&&input.templateId!==implied)return null;
-    templateId=implied;
+    // Effect identity is opaque to the relay (pack effects are not
+    // templates): validate shape only. Artwork consistency is still
+    // enforced through templateId below.
+    if(!optString(input.effectId,1,128)||!/^effect-[A-Za-z0-9][A-Za-z0-9_-]*$/.test(input.effectId))return null;
   }
   if(!TEMPLATES.has(templateId)||!templateId.startsWith(input.moment+"-"))return null;
   if(input.mediaFile!==undefined&&!validMedia(input.mediaFile))return null;

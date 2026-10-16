@@ -302,13 +302,18 @@ test("reconnects after a relay restart on the same port", async () => {
     relay = rebound as RelayHandle;
 
     // The overlay's EventSource must reattach before anything published
-    // can be delivered: triggers are broadcast, not persisted.
+    // can be delivered: triggers are broadcast, not persisted. Fetches in
+    // the rebind window may hit half-closed sockets — keep polling.
     const deadline = Date.now() + 20000;
     for (;;) {
-      const health = await (
-        await fetch(`${relay.base}/api/health`)
-      ).json() as { connectedOverlays?: number };
-      if ((health.connectedOverlays ?? 0) >= 1) break;
+      try {
+        const health = await (
+          await fetch(`${relay.base}/api/health`)
+        ).json() as { connectedOverlays?: number };
+        if ((health.connectedOverlays ?? 0) >= 1) break;
+      } catch {
+        // Port rebinding or a destroyed lingering connection: retry.
+      }
       if (Date.now() > deadline) throw new Error("overlay did not reconnect");
       await page.waitForTimeout(250);
     }

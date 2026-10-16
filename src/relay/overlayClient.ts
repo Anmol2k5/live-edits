@@ -1,12 +1,13 @@
 import { getTemplateById } from "../templates/templates";
-import { getEffectById, getTemplateForEffect } from "../effects/registry";
+import { resolveEffectById, resolveTemplateForEffect } from "../packs/resolve";
+import type { ReactionPack } from "../packs/packSchemas";
 import type { TriggerEvent } from "../trigger/TriggerEvent";
 import {
   isTriggerContractEvent,
   type TriggerContractEvent,
 } from "../trigger/triggerSchemas";
 
-const RELAY = "http://127.0.0.1:4190";
+const DEFAULT_RELAY = "http://127.0.0.1:4190";
 
 export type PublishableTrigger = TriggerEvent | TriggerContractEvent;
 
@@ -24,20 +25,28 @@ export interface PublishMediaOptions {
  * desktop UI. M2 contract fields (trigger id, dedup key, expiry, effect
  * reference) travel with the payload so the relay can validate, expire and
  * deduplicate at its receiving boundary.
+ *
+ * M6: with a pack, effect triggers resolve pack-first and media effects
+ * publish their full playback config (media file, duration, volume, trim,
+ * position, queue, priority, cooldown) — the same fields the editor
+ * preview renders. Caller `media` options override the effect defaults.
  */
 export async function publishOverlayTrigger(
   input: PublishableTrigger,
   publishToken: string,
-  media: string | PublishMediaOptions = ""
+  media: string | PublishMediaOptions = "",
+  pack?: ReactionPack | null,
+  relayBase: string = DEFAULT_RELAY
 ): Promise<number> {
   if (!publishToken) throw new Error("Enter the relay publish token.");
   const opts: PublishMediaOptions =
     typeof media === "string" ? { mediaFile: media } : media;
-  const body = buildPayload(input, opts);
+  const body = buildPayload(input, opts, pack);
+  const base = relayBase.replace(/\/+$/, "");
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 4500);
   try {
-    const response = await fetch(RELAY + "/api/trigger", {
+    const response = await fetch(base + "/api/trigger", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + publishToken },
       body: JSON.stringify(body),
@@ -53,7 +62,8 @@ export async function publishOverlayTrigger(
 
 function buildPayload(
   input: PublishableTrigger,
-  opts: PublishMediaOptions
+  opts: PublishMediaOptions,
+  pack?: ReactionPack | null
 ): Record<string, unknown> {
   const mediaFile = (opts.mediaFile ?? "").trim();
   const payload: Record<string, unknown> = {};
@@ -66,35 +76,28 @@ function buildPayload(
       case "moment": {
         payload.moment = input.moment;
         payload.templateId = `${input.moment}-1`;
-        attachPolicy(payload, `effect-${input.moment}-1`);
+        attachPolicy(payload, `effect-${input.moment}-1`, pack);
         break;
       }
       case "template": {
         payload.templateId = input.templateId;
         payload.moment = getTemplateById(input.templateId).moment;
-        attachPolicy(payload, `effect-${input.templateId}`);
+        attachPolicy(payload, `effect-${input.templateId}`, pack);
         break;
       }
       case "effect": {
-        const effect = getEffectById(input.effectId);
-        const template = getTemplateForEffect(effect);
-        payload.effectId = input.effectId;
-        payload.templateId = template.id;
-        payload.moment = template.moment;
-        payload.queue = effect.queue;
-        payload.priority = effect.priority;
-        payload.cooldownMs = effect.cooldownMs;
+        applyPackEffect(payload, input.effectId, pack);
         break;
       }
     }
   } else if (input.source === "manual") {
     payload.moment = getTemplateById(input.templateId).moment;
     payload.templateId = input.templateId;
-    attachPolicy(payload, `effect-${input.templateId}`);
+    attachPolicy(payload, `effect-${input.templateId}`, pack);
   } else {
     payload.moment = input.moment;
     payload.templateId = `${input.moment}-1`;
-    attachPolicy(payload, `effect-${input.moment}-1`);
+    attachPolicy(payload, `effect-${input.moment}-1`, pack);
   }
   if (mediaFile) payload.mediaFile = mediaFile;
   if (opts.durationMs !== undefined) payload.durationMs = opts.durationMs;
@@ -105,9 +108,13 @@ function buildPayload(
   return payload;
 }
 
-function attachPolicy(payload: Record<string, unknown>, effectId: string): void {
+function attachPolicy(
+  payload: Record<string, unknown>,
+  effectId: string,
+  pack?: ReactionPack | null
+): void {
   try {
-    const effect = getEffectById(effectId);
+    const effect = resolveEffectById(effectId, pack);
     payload.queue = effect.queue;
     payload.priority = effect.priority;
     payload.cooldownMs = effect.cooldownMs;
@@ -115,5 +122,44 @@ function attachPolicy(payload: Record<string, unknown>, effectId: string): void 
     payload.queue = "replace";
     payload.priority = 50;
     payload.cooldownMs = 0;
+  }
+}
+
+/**
+ * Pack-first effect payload. Frame effects keep the legacy template path;
+ * media effects carry their full playback config so the OBS overlay plays
+ * exactly what the editor preview renders. Caller media options (applied
+ * afterwards in buildPayload) override effect defaults.
+ */
+function applyPackEffect(
+  payload: Record<string, unknown>,
+  effectId: string,
+  pack?: ReactionPack | null
+): void {
+  const effect = resolveEffectById(effectId, pack);
+  payload.effectId = effectId;
+  payload.moment = effect.moment;
+  payload.queue = effect.queue;
+  payload.priority = effect.priority;
+  payload.cooldownMs = effect.cooldownMs;
+  if (effect.kind === "frame") {
+    // V1 path: no duration override — the relay default (2700ms) applies,
+    // exactly as before packs existed. Caller opts can still override.
+    const template = resolveTemplateForEffect(effect);
+    payload.templateId = template?.id ?? `${effect.moment}-1`;
+    return;
+  }
+  payload.durationMs = effect.durationMs;
+  const mediaFile = (effect as { mediaFile?: string }).mediaFile;
+  const template = resolveTemplateForEffect(effect);
+  payload.templateId = template?.id ?? `${effect.moment}-1`;
+  if (mediaFile) payload.mediaFile = mediaFile;
+  if ("volume" in effect) payload.volume = effect.volume;
+  if ("position" in effect) payload.position = effect.position;
+  if ("clipStartMs" in effect && effect.clipStartMs !== undefined) {
+    payload.clipStartMs = effect.clipStartMs;
+  }
+  if ("clipEndMs" in effect && effect.clipEndMs !== undefined) {
+    payload.clipEndMs = effect.clipEndMs;
   }
 }

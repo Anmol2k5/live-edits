@@ -68,6 +68,19 @@ Scope: A working Tauri 2 desktop app that detects facial expressions from a webc
 
 CI passing does not close hardware/manual gates.
 
+## Milestone 6 gates — reaction packs & effect editor
+
+- [x] Dedicated CI jobs (`.github/workflows/checks.yml`, `e2e.yml`); e2e splits `playback` (autoplay-permissive) from `autoplay-default` (stock policy, graceful-degradation only — never an audibility claim)
+- [x] Four editor areas (media library / 16:9 transparent preview / properties / sequence track) in a dark-mode-first creator layout, no webcam required
+- [x] Pack system: create/rename/duplicate/delete, trigger assignments, save/load (localStorage JSON, no binaries), export/import with validation + id-collision rewrite, full-sequence preview
+- [x] Editor drives the real engine: shared scheduler admission, shared effect contracts, pack-aware publish (media effects carry full playback config); preview/OBS parity pinned by mapping tests
+- [x] UX: loading/error/empty states, keyboard-accessible controls, undo/redo (50), two-step destructive confirms, unsaved-changes guard on pack switch, responsive collapse
+- [x] Relay base URL configurable (default loopback :4190); effect ids opaque to the relay (shape-validated, template-moment consistency still enforced)
+- [ ] Physical OBS Studio launch test on Windows — NOT TESTED (steps in docs/OBS_SETUP.md)
+- [ ] Physical webcam expression → OBS reaction — NOT TESTED (no webcam here)
+- [ ] Rust/Tauri desktop packaging — BLOCKED (no cargo/rustc)
+- [ ] App-data directory media persistence — INVESTIGATED, not implemented (needs Rust fs scope; docs/EDITOR.md)
+
 ## Milestone 3 gates — real-time video/audio reaction engine (OBS target)
 
 - [x] Tauri CSP allows only the loopback relay (`http://127.0.0.1:4190`, `http://localhost:4190`) in `connect-src`; all other M1 restrictions unchanged — `src-tauri/tauri.conf.json`

@@ -23,12 +23,23 @@ By default the bridge shows the existing PNG meme frame with a small locally gen
 
 This bridge binds only to \`127.0.0.1:4190\`; it is intended to run on the same machine as OBS. It generates separate read and publish tokens at startup. The tokens expire when the relay exits. It is not suitable for hosting on a public interface or for SaaS accounts.
 
+## Reaction editor
+
+The **Editor** tab builds validated reaction packs with no webcam: import
+media, create effects, tune every property, chain timed sequences, preview on
+a transparent 16:9 stage, then fire straight to OBS. Packs persist as JSON in
+localStorage (media stays in-session; reimport after reload), export/import
+as `.live-edits.json`, and the active pack resolves live camera and manual
+triggers first. Full guide: `docs/EDITOR.md`. Audible output is only ever
+claimed after the manual check in `docs/OBS_SETUP.md` — automated tests
+assert play *permission* (`paused === false`), never heard sound.
+
 ## Checks
 
 - `npm run typecheck` — TypeScript (app + e2e + shared fixtures)
 - `npm run test` — Vitest unit + jsdom browser-engine tests
 - `npm run test:relay` — Node relay tests + shared scheduler conformance
-- `npm run test:e2e` — Playwright real-Chromium overlay tests (needs system Chrome; point TEMP at a writable disk if C: is full)
+- `npm run test:e2e` — Playwright real-Chromium tests: `playback` project (overlay suite + editor→OBS workflow) and `autoplay-default` project (graceful refusal, never an audibility claim). Needs system Chrome or `playwright install`; point TEMP at a writable disk if C: is full
 - `npm run build` — frontend production build
 - `npm run tauri build` — desktop packaging (requires Rust and desktop toolchain)
 - `npm audit` — dependency audit (currently 0 vulnerabilities)

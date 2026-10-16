@@ -1,20 +1,22 @@
-name: Live Edits checks
+name: checks
+
 on:
-  pull_request:
   push:
-    branches: [main]
+    branches: [main, feature/obs-reaction-mvp]
+  pull_request:
+
 jobs:
-  frontend-and-relay:
+  checks:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: 22
           cache: npm
       - run: npm ci
       - run: npm run typecheck
       - run: npm run test
       - run: npm run test:relay
       - run: npm run build
+      - run: npm audit

@@ -120,7 +120,15 @@ test("relay validates M3 contract fields: expiry, dedup, queue metadata", async 
 
     response=await fetch(base+"/api/trigger",{method:"POST",headers,
       body:JSON.stringify({moment:"wow",effectId:"effect-sad-1"})});
-    assert.equal(response.status,400,"effect/template mismatch is rejected");
+    assert.equal(response.status,202,"pack effect ids are opaque to the relay");
+
+    response=await fetch(base+"/api/trigger",{method:"POST",headers,
+      body:JSON.stringify({moment:"wow",effectId:"not-an-effect"})});
+    assert.equal(response.status,400,"malformed effect ids are rejected");
+
+    response=await fetch(base+"/api/trigger",{method:"POST",headers,
+      body:JSON.stringify({moment:"wow",templateId:"sad-1"})});
+    assert.equal(response.status,400,"template artwork must still match the moment");
   } finally {
     await relay.close();
   }

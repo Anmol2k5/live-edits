@@ -94,4 +94,81 @@ describe("overlayClient payload (M3)", () => {
       )
     ).rejects.toThrow(/publish token/i);
   });
+
+  it("publishes pack media effects with their full playback config", async () => {
+    const calls = mockFetch();
+    const { createPack } = await import("../../packs/packSchemas");
+    const pack = createPack("Stream Pack");
+    pack.effects.push({
+      id: "custom-clip",
+      name: "Clip",
+      kind: "video",
+      mediaFile: "clip.webm",
+      moment: "wow",
+      durationMs: 3200,
+      delayMs: 0,
+      cooldownMs: 1000,
+      priority: 70,
+      queue: "queue",
+      enabled: true,
+      volume: 0.4,
+      position: "fullscreen",
+      entrance: "fade",
+      exit: "fade",
+      muted: false,
+      clipStartMs: 200,
+      clipEndMs: 2200,
+    });
+    const event = createEffectTrigger("custom-clip", { source: "manual" });
+    await publishOverlayTrigger(event, "token", "", pack);
+    expect(calls[0].body).toMatchObject({
+      effectId: "custom-clip",
+      moment: "wow",
+      templateId: "wow-1",
+      mediaFile: "clip.webm",
+      durationMs: 3200,
+      volume: 0.4,
+      position: "fullscreen",
+      queue: "queue",
+      priority: 70,
+      cooldownMs: 1000,
+      clipStartMs: 200,
+      clipEndMs: 2200,
+    });
+  });
+
+  it("lets caller media options override pack effect defaults", async () => {
+    const calls = mockFetch();
+    const { createPack } = await import("../../packs/packSchemas");
+    const pack = createPack("Stream Pack");
+    pack.effects.push({
+      id: "custom-clip",
+      name: "Clip",
+      kind: "video",
+      mediaFile: "clip.webm",
+      moment: "wow",
+      durationMs: 3200,
+      delayMs: 0,
+      cooldownMs: 0,
+      priority: 50,
+      queue: "replace",
+      enabled: true,
+      volume: 0.4,
+      position: "center",
+      entrance: "pop",
+      exit: "fade",
+      muted: false,
+    });
+    const event = createEffectTrigger("custom-clip", { source: "manual" });
+    await publishOverlayTrigger(event, "token", { volume: 0.9 }, pack);
+    expect(calls[0].body).toMatchObject({ volume: 0.9, durationMs: 3200 });
+  });
+
+  it("rejects unknown effect ids instead of publishing blindly", async () => {
+    mockFetch();
+    const event = createEffectTrigger("effect-ghost", { source: "manual" });
+    await expect(publishOverlayTrigger(event, "token", "")).rejects.toThrow(
+      /Unknown effect ID/
+    );
+  });
 });

@@ -1,5 +1,47 @@
 # Changelog
 
+## M6 — Reaction packs & effect editor (branch feature/obs-reaction-mvp)
+
+Scope: master-prompt Milestone 6 only. No SaaS accounts/billing, no merge, no deploy, no release claim. Foundation (M0–M5) preserved; editor is additive (`src/editor/`, `src/packs/`) plus narrow pack-aware wiring in the pipeline, publisher and App.
+
+### Automation gaps closed
+
+- New `.github/workflows/checks.yml` (ci, typecheck, vitest, relay+conformance, build, audit) and `e2e.yml` (Playwright on `ubuntu-latest` with real Chromium install; failure artifacts).
+- `playwright.config.ts` now splits `playback` (autoplay-permissive, `overlay.spec.ts` + `editor.spec.ts`) from `autoplay-default` (stock policy, `policy.spec.ts`). The permissive suite asserts `paused === false` (allowed to play) — audibility is explicitly never claimed headless; the default-policy suite asserts refusal degrades to a status message + timed cleanup + idle transparency.
+- `vite.config.ts` ignores ephemeral dirs (`.tmp-pw`, e2e output) so local browser profiles never crash the dev watcher (fixed a real EBUSY crash).
+
+### Reaction packs
+
+- `src/packs/packSchemas.ts`: versioned (`version: 1`) packs with effects, trigger assignments (source + optional moment → effect) and sequence steps; `parsePack` enforces referential integrity; create/rename/duplicate/serialize/import with id-collision rewrite.
+- `src/packs/packStore.ts`: localStorage JSON only — filenames, never binaries/object URLs (quota-safe); corrupt data starts clean without destroying the raw value; active-pack tracking.
+- `src/packs/resolve.ts`: pack-first, static-registry-fallback resolution for effects and moment triggers; disabled pack effects fall back to the V1 pick, so pre-pack behavior is byte-identical without a pack.
+
+### Editor (all four areas, webcam-free)
+
+- Left `MediaLibraryPanel`: import (validated), search/filter, previews + metadata, usage counts, two-step remove for used media; files list instantly with metadata filling in (probe never blocks import).
+- Center `PreviewStage`: transparent 16:9 stage rendering the shared `effectToPlayback` mapping (parity with the OBS player, pinned by matrix tests), progress bar, idle restore, teardown release.
+- Right `EffectPropertiesPanel`: every field from the brief (name/kind/media/position/duration/trim/volume/priority/cooldown/queue/entrance/exit/enabled/assignments) with per-field Zod errors, Preview + Fire-to-OBS, missing-token guidance.
+- Bottom `SequencePanel`: visual track with proportional bars, add/remove/reorder, per-step delay edit, play/pause/seek-slider/reset, active + skipped states.
+- `useSequencePlayback`: timed cues admitted through the shared scheduler core (same engine as OBS) — refused cues are reported, never faked; fixed a real re-admission spam bug and a render-loop reset bug found by tests.
+- `useUndoable` (50-step) + dirty tracking + save/discard/cancel switch guard; two-step confirms for pack/effect/used-media deletes; full keyboard reachability with live regions; responsive single-column collapse.
+- Media binaries live in the session `MediaRegistry` only; reloads mark entries for reimport. App-data directory migration investigated in `docs/EDITOR.md` (needs Rust fs scope — not verifiable here, schemas already shaped for it).
+
+### Engine connection (no second scheduler)
+
+- `publishOverlayTrigger` and `useEditPipeline.fireTrigger` accept an optional pack: effect triggers resolve pack-first; media effects publish full playback config (media/duration/volume/trim/position/queue/priority/cooldown) with caller overrides winning; frame effects keep the exact V1 template path and relay timing.
+- Detector path: pack moment assignments route to pack effects (media → OBS-only publish, frame → local compose + publish); manual console unchanged.
+- Relay: `effectId` is now opaque (shape-validated) instead of requiring `effect-<template>` form — the e2e run caught the old rule rejecting every editor-built effect. Template↔moment consistency still enforced.
+- `POST /api/overlay-url` and relay base URL configurability (RelayPanel field, default loopback :4190) came out of the same e2e debugging (hardcoded port).
+
+### Verification (actual runs, this environment)
+
+- `npm ci` clean; `npm run typecheck` clean (now also covers `tests/e2e`).
+- `npm run test`: full Vitest suite green, including new pack/media/undo/sequence/playback/panel suites and the 5-test editor workflow (pack→import→effect→preview→fire, invalid trims, undo/redo + switch guard, export/import round-trip, token gating).
+- `npm run test:relay`: relay + conformance green (opaque effect ids, template-moment consistency).
+- `npm run test:e2e`: `playback` green (overlay suite + new editor→OBS workflow: build pack headlessly, fire, real overlay plays the file), `autoplay-default` green (graceful refusal).
+- `npm run build` success; `npm audit` 0 vulnerabilities; Tauri packaging still BLOCKED (no cargo/rustc).
+- Manual Windows/OBS/webcam results: never faked — gaps listed below.
+
 ## M4/M5 — OBS integration, companion reliability, streaming verification (2026-10-16, branch feature/obs-reaction-mvp)
 
 Scope: master-prompt Milestones 4–5 only. No SaaS auth/billing/Twitch work. No merge, no release claim.

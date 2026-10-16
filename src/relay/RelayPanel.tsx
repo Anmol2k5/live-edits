@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-const RELAY_BASE = "http://127.0.0.1:4190";
+export const DEFAULT_RELAY_BASE = "http://127.0.0.1:4190";
 
 export interface MediaItem {
   name: string;
@@ -9,6 +9,8 @@ export interface MediaItem {
 }
 
 interface RelayPanelProps {
+  relayBase: string;
+  setRelayBase: (base: string) => void;
   relayToken: string;
   setRelayToken: (token: string) => void;
   mediaFile: string;
@@ -85,6 +87,8 @@ export async function probeAudioPlayback(): Promise<
  * webview cannot spawn it and how a Tauri sidecar would.
  */
 export function RelayPanel({
+  relayBase,
+  setRelayBase,
   relayToken,
   setRelayToken,
   mediaFile,
@@ -116,12 +120,13 @@ export function RelayPanel({
   // overlay count and boot id, no secrets).
   useEffect(() => {
     let cancelled = false;
+    const base = relayBase.replace(/\/+$/, "");
     const check = async () => {
       try {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 2500);
         try {
-          const response = await fetch(`${RELAY_BASE}/api/health`, {
+          const response = await fetch(`${base}/api/health`, {
             signal: controller.signal,
           });
           if (!cancelled && response.ok) {
@@ -152,7 +157,7 @@ export function RelayPanel({
       cancelled = true;
       clearInterval(interval);
     };
-  }, []);
+  }, [relayBase]);
 
   const handleCopyUrl = useCallback(async () => {
     setUrlNote("");
@@ -161,7 +166,7 @@ export function RelayPanel({
       return;
     }
     try {
-      const response = await fetch(`${RELAY_BASE}/api/overlay-url`, {
+      const response = await fetch(`${relayBase.replace(/\/+$/, "")}/api/overlay-url`, {
         method: "POST",
         headers: { Authorization: "Bearer " + relayToken.trim() },
       });
@@ -188,7 +193,7 @@ export function RelayPanel({
     } catch {
       setUrlNote("Relay unreachable — run `npm run relay` in a terminal.");
     }
-  }, [relayToken]);
+  }, [relayToken, relayBase]);
 
   const refreshMedia = useCallback(async () => {
     setMediaNote("");
@@ -197,7 +202,7 @@ export function RelayPanel({
       return;
     }
     try {
-      const response = await fetch(`${RELAY_BASE}/api/media`, {
+      const response = await fetch(`${relayBase.replace(/\/+$/, "")}/api/media`, {
         headers: { Authorization: "Bearer " + relayToken.trim() },
       });
       if (response.status === 403) {
@@ -216,7 +221,7 @@ export function RelayPanel({
     } catch {
       setMediaNote("Relay unreachable — run `npm run relay` in a terminal.");
     }
-  }, [relayToken]);
+  }, [relayToken, relayBase]);
 
   const probeAudio = useCallback(async () => {
     setAudioNote("Probing…");
@@ -238,6 +243,15 @@ export function RelayPanel({
         OBS Bridge · {relayStatus} · {health}
       </summary>
       <div className="relay-settings__fields">
+        <label>
+          Relay base URL
+          <input
+            value={relayBase}
+            onChange={(e) => setRelayBase(e.target.value)}
+            placeholder="http://127.0.0.1:4190"
+            inputMode="url"
+          />
+        </label>
         <label>
           Publish token (from npm run relay)
           <input
