@@ -81,6 +81,17 @@ CI passing does not close hardware/manual gates.
 - [ ] Rust/Tauri desktop packaging — BLOCKED (no cargo/rustc)
 - [ ] App-data directory media persistence — INVESTIGATED, not implemented (needs Rust fs scope; docs/EDITOR.md)
 
+## Milestone 6.1 gates — finish the reaction-pack workflow
+
+- [x] Automatic media transfer: authenticated streaming uploads (50 MB, content sniffing, atomic rename, 409 on duplicates), inventory, explicit delete, reload persistence on disk; Editor streams imports automatically with a token plus manual Send/Replace/Delete with confirms — `scripts/overlay-relay.mjs`, `src/relay/mediaTransfer.ts`, `src/editor/ReactionEditor.tsx`, `src/editor/MediaLibraryPanel.tsx`
+- [x] Active-pack trigger resolution for manual and facial-expression paths with V1 fallback; source wildcards (no-moment assignments) match after exact rules — `src/packs/resolve.ts`, `src/App.tsx`, `src/hooks/useEditPipeline.ts`, `src/relay/overlayClient.ts`
+- [x] Effect settings survive to OBS (volume, duration, position, trim, queue, priority, cooldown, effect identity); blank Live-panel fields mean no override — `src/relay/overlayClient.ts`, `src/App.tsx`
+- [x] Collision handling: duplicate pack ids refreshed, colliding effect ids rewritten with refs preserved, stale object URLs revoked, stale probe results rejected, destructive relay replaces confirmed — `src/packs/packSchemas.ts`, `src/editor/mediaLibrary.ts`, `src/editor/MediaLibraryPanel.tsx`
+- [x] End-to-end workflow verified in real Chromium: create pack, import, transfer, effect, manual assignment, save, activate, Live trigger plays relay file, cleanup, reload plays again with no reimport — `tests/e2e/editor.spec.ts`
+- [ ] Physical OBS Studio launch test on Windows — NOT TESTED (steps in docs/OBS_SETUP.md)
+- [ ] Physical webcam expression → OBS reaction — NOT TESTED (no webcam here)
+- [ ] Rust/Tauri desktop packaging — BLOCKED (no cargo/rustc)
+
 ## Milestone 3 gates — real-time video/audio reaction engine (OBS target)
 
 - [x] Tauri CSP allows only the loopback relay (`http://127.0.0.1:4190`, `http://localhost:4190`) in `connect-src`; all other M1 restrictions unchanged — `src-tauri/tauri.conf.json`

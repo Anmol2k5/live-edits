@@ -25,6 +25,59 @@ export function resolveEffectById(
 }
 
 /**
+ * The single matching rule every trigger source shares: first pack
+ * assignment with equal source and equal moment whose effect is enabled
+ * wins. Assignments without a moment are wildcards: they match any moment
+ * for their source but only after exact matches, so timer/hotkey "play
+ * this regardless" entries work without shadowing specific moment rules.
+ * Returns null when nothing matches (caller falls back to V1).
+ */
+export function findAssignment(
+  moment: MomentType,
+  source: TriggerSource,
+  pack?: ReactionPack | null
+): AnyEffect | null {
+  if (!pack) return null;
+  for (const assignment of pack.assignments) {
+    if (assignment.source !== source) continue;
+    if (assignment.moment !== moment) continue;
+    const effect = pack.effects.find((e) => e.id === assignment.effectId);
+    if (effect && effect.enabled) return effect;
+  }
+  for (const assignment of pack.assignments) {
+    if (assignment.source !== source) continue;
+    if (assignment.moment !== undefined) continue;
+    const effect = pack.effects.find((e) => e.id === assignment.effectId);
+    if (effect && effect.enabled) return effect;
+  }
+  return null;
+}
+
+export type TemplateResolution =
+  | { kind: "frame"; template: Template }
+  | { kind: "media"; effect: AnyEffect }
+  | { kind: "static"; template: Template };
+
+/**
+ * Shared template-trigger rule: a pack assignment for (source, moment)
+ * selects the assigned frame template or routes to the assigned media
+ * effect; otherwise the requested template plays unchanged (V1).
+ */
+export function resolveTemplateTrigger(
+  templateId: string,
+  source: TriggerSource,
+  pack?: ReactionPack | null
+): TemplateResolution {
+  const template = getTemplateById(templateId);
+  const assigned = findAssignment(template.moment, source, pack);
+  if (!assigned) return { kind: "static", template };
+  if (assigned.kind === "frame") {
+    return { kind: "frame", template: getTemplateById(assigned.templateId) };
+  }
+  return { kind: "media", effect: assigned };
+}
+
+/**
  * Resolve a moment trigger to the effect that should play. Pack assignments
  * matching (source, moment) win in pack order; otherwise the static random
  * template pick (V1 behaviour) applies. Returns null only when nothing is
@@ -36,14 +89,7 @@ export function resolveMomentToEffect(
   pack?: ReactionPack | null,
   random: () => number = Math.random
 ): AnyEffect | EffectConfig | null {
-  if (pack) {
-    for (const assignment of pack.assignments) {
-      if (assignment.source !== source || assignment.moment !== moment) continue;
-      const effect = pack.effects.find((e) => e.id === assignment.effectId);
-      if (effect && effect.enabled) return effect;
-    }
-  }
-  return pickStaticRandomEffect(moment, random);
+  return findAssignment(moment, source, pack) ?? pickStaticRandomEffect(moment, random);
 }
 
 /**

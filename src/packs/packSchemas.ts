@@ -112,29 +112,45 @@ export function serializePack(pack: ReactionPack): string {
   return JSON.stringify(parsePack(pack));
 }
 
+export interface ImportCollisionSets {
+  packIds: Set<string>;
+  effectIds?: Set<string>;
+}
+
 /**
- * Deserialize imported data. Unknown effect IDs collide by rename: on id
- * clash the incoming effect keeps its config but takes a fresh id, and all
- * references are rewritten.
+ * Deserialize imported data. Colliding ids are rewritten safely:
+ * - duplicate effect ids take `-imported-N` ids with all assignment and
+ *   sequence references rewritten, preserving integrity;
+ * - a duplicate pack id takes a fresh id (and an "(imported)" name suffix),
+ *   so importing the same file twice never yields duplicate pack IDs.
  */
-export function importPack(data: unknown, existingIds: Set<string>): ReactionPack {
+export function importPack(data: unknown, existing: ImportCollisionSets): ReactionPack {
   const pack = parsePack(data);
+  const effectIds = existing.effectIds ?? new Set<string>();
   const idMap = new Map<string, string>();
   for (const effect of pack.effects) {
-    if (existingIds.has(effect.id) || idMap.has(effect.id)) {
+    if (effectIds.has(effect.id) || idMap.has(effect.id)) {
       let n = 2;
       let candidate = `${effect.id}-imported-${n}`;
-      while (existingIds.has(candidate) || [...idMap.values()].includes(candidate)) {
+      while (effectIds.has(candidate) || [...idMap.values()].includes(candidate)) {
         n += 1;
         candidate = `${effect.id}-imported-${n}`;
       }
       idMap.set(effect.id, candidate);
     }
   }
-  if (idMap.size === 0) return pack;
-  const rewrite = (id: string): string => idMap.get(id) ?? id;
+  let id = pack.id;
+  let name = pack.name;
+  if (existing.packIds.has(pack.id)) {
+    id = generatePackId();
+    name = `${pack.name} (imported)`.slice(0, 80);
+  }
+  if (idMap.size === 0 && id === pack.id) return pack;
+  const rewrite = (effectId: string): string => idMap.get(effectId) ?? effectId;
   return parsePack({
     ...pack,
+    id,
+    name,
     effects: pack.effects.map((e) => ({ ...e, id: rewrite(e.id) })),
     assignments: pack.assignments.map((a) => ({ ...a, effectId: rewrite(a.effectId) })),
     sequence: pack.sequence.map((s) => ({ ...s, effectId: rewrite(s.effectId) })),

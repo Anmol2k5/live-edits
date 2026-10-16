@@ -151,6 +151,16 @@ export class MediaRegistry {
   private readonly records = new Map<string, MediaRecord>();
 
   add(record: MediaRecord): void {
+    // Reimporting the same filename replaces the entry: release the stale
+    // object URL first so repeated imports never leak blobs.
+    const previous = this.records.get(record.name);
+    if (previous && previous.url !== record.url) {
+      try {
+        URL.revokeObjectURL(previous.url);
+      } catch {
+        // Revocation is best-effort; the record is still replaced.
+      }
+    }
     this.records.set(record.name, record);
   }
 
@@ -186,6 +196,23 @@ export class MediaRegistry {
   get size(): number {
     return this.records.size;
   }
+}
+
+/**
+ * Apply async probe metadata only when the record still points at the
+ * probed URL. A file replaced (or removed) mid-probe must never receive
+ * stale dimensions/duration.
+ */
+export function applyProbeResult(
+  registry: MediaRegistry,
+  name: string,
+  url: string,
+  meta: MediaMetadata
+): boolean {
+  const current = registry.get(name);
+  if (!current || current.url !== url) return false;
+  registry.add({ ...current, ...meta });
+  return true;
 }
 
 export function searchMedia(

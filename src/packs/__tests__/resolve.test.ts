@@ -1,9 +1,11 @@
 import { describe, it, expect } from "vitest";
 import { createPack } from "../packSchemas";
 import {
+  findAssignment,
   resolveEffectById,
   resolveMomentToEffect,
   resolveTemplateForEffect,
+  resolveTemplateTrigger,
 } from "../resolve";
 
 function videoEffect(id: string, moment: "wow" | "funny" | "sad" = "wow") {
@@ -80,5 +82,73 @@ describe("pack-aware resolution (M6)", () => {
       resolveTemplateForEffect({ id: "x", name: "X", kind: "frame", templateId: "wow-1", moment: "wow", durationMs: 8000, delayMs: 0, cooldownMs: 0, priority: 50, queue: "replace", enabled: true, zIndex: 100, opacity: 1 })?.id
     ).toBe("wow-1");
     expect(resolveTemplateForEffect(videoEffect("v"))).toBeNull();
+  });
+
+  it("matches assignments by source and moment only", () => {
+    const pack = createPack("p");
+    pack.effects.push(videoEffect("custom-1", "wow"));
+    pack.assignments.push({ id: "a1", source: "manual", moment: "wow", effectId: "custom-1" });
+    expect(findAssignment("wow", "manual", pack)?.id).toBe("custom-1");
+    expect(findAssignment("wow", "ai-detector", pack)).toBeNull();
+    expect(findAssignment("sad", "manual", pack)).toBeNull();
+    expect(findAssignment("wow", "manual", null)).toBeNull();
+  });
+
+  it("routes template triggers to assigned frames or media", () => {
+    const pack = createPack("p");
+    pack.effects.push(videoEffect("custom-1", "wow"));
+    pack.assignments.push({ id: "a1", source: "manual", moment: "wow", effectId: "custom-1" });
+    const media = resolveTemplateTrigger("wow-1", "manual", pack);
+    expect(media.kind).toBe("media");
+    if (media.kind === "media") expect(media.effect.id).toBe("custom-1");
+
+    const pack2 = createPack("p2");
+    pack2.effects.push({
+      id: "frame-1",
+      name: "F",
+      kind: "frame",
+      templateId: "wow-2",
+      moment: "wow",
+      durationMs: 8000,
+      delayMs: 0,
+      cooldownMs: 0,
+      priority: 50,
+      queue: "replace",
+      enabled: true,
+      zIndex: 100,
+      opacity: 1,
+    });
+    pack2.assignments.push({ id: "a1", source: "manual", moment: "wow", effectId: "frame-1" });
+    const frame = resolveTemplateTrigger("wow-1", "manual", pack2);
+    expect(frame.kind).toBe("frame");
+    if (frame.kind === "frame") expect(frame.template.id).toBe("wow-2");
+
+    const plain = resolveTemplateTrigger("wow-1", "manual", null);
+    expect(plain.kind).toBe("static");
+    if (plain.kind === "static") expect(plain.template.id).toBe("wow-1");
+  });
+
+  it("treats assignments without a moment as source wildcards after exact matches", () => {
+    const pack = createPack("p");
+    pack.effects.push(videoEffect("specific", "wow"));
+    pack.effects.push(videoEffect("generic", "sad"));
+    pack.assignments.push({ id: "a1", source: "timer", moment: "wow", effectId: "specific" });
+    pack.assignments.push({ id: "a2", source: "timer", effectId: "generic" });
+    // Exact moment wins when present.
+    expect(findAssignment("wow", "timer", pack)?.id).toBe("specific");
+    // Other moments fall through to the wildcard.
+    expect(findAssignment("sad", "timer", pack)?.id).toBe("generic");
+    expect(findAssignment("funny", "timer", pack)?.id).toBe("generic");
+    // Other sources do not match the wildcard.
+    expect(findAssignment("sad", "manual", pack)).toBeNull();
+  });
+
+  it("prefers exact moment rules over later wildcards in pack order", () => {
+    const pack = createPack("p");
+    pack.effects.push(videoEffect("wild", "wow"));
+    pack.effects.push(videoEffect("exact", "wow"));
+    pack.assignments.push({ id: "w", source: "hotkey", effectId: "wild" });
+    pack.assignments.push({ id: "e", source: "hotkey", moment: "wow", effectId: "exact" });
+    expect(findAssignment("wow", "hotkey", pack)?.id).toBe("exact");
   });
 });

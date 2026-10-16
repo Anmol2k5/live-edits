@@ -19,7 +19,7 @@ Prerequisites: Node.js 22 and npm. Tauri packaging also needs Rust and platform-
 
 For debugging, append \`&debug=1\` to the Browser Source URL to display connection status in the overlay. Never show that URL publicly.
 
-By default the bridge shows the existing PNG meme frame with a small locally generated tone. To play a custom MP4/WebM/GIF/image/audio file, put a media file in \`public/reactions/\` and enter **just the filename** in the OBS Bridge UI. The relay enforces a filename allowlist and a 50 MB media limit. A video includes its own audio when OBS permits playback. Configure OBS Browser Source audio capture as needed.
+By default the bridge shows the existing PNG meme frame with a small locally generated tone. To play a custom MP4/WebM/GIF/image/audio file, import it in the Editor Media panel with the relay publish token set: it streams straight to the relay with no manual copying. The relay enforces a filename allowlist and a 50 MB media limit. Duplicate names are refused (409) -- use Replace (confirmed delete-then-upload) to overwrite. Check relay files with Refresh relay files (Editor) or Check relay media (OBS Bridge); delete explicitly when done. A video includes its own audio when OBS permits playback. Configure OBS Browser Source audio capture as needed.
 
 This bridge binds only to \`127.0.0.1:4190\`; it is intended to run on the same machine as OBS. It generates separate read and publish tokens at startup. The tokens expire when the relay exits. It is not suitable for hosting on a public interface or for SaaS accounts.
 
@@ -28,7 +28,7 @@ This bridge binds only to \`127.0.0.1:4190\`; it is intended to run on the same 
 The **Editor** tab builds validated reaction packs with no webcam: import
 media, create effects, tune every property, chain timed sequences, preview on
 a transparent 16:9 stage, then fire straight to OBS. Packs persist as JSON in
-localStorage (media stays in-session; reimport after reload), export/import
+localStorage (relay media persists on disk so saved effects fire after reload with no reimport; local previews need reimport), export/import
 as `.live-edits.json`, and the active pack resolves live camera and manual
 triggers first. Full guide: `docs/EDITOR.md`. Audible output is only ever
 claimed after the manual check in `docs/OBS_SETUP.md` — automated tests

@@ -2,8 +2,13 @@ import { useCallback } from "react";
 import { useEditComposer } from "./useEditComposer";
 import { getTemplateById } from "../templates/templates";
 import { getTemplateForEffect } from "../effects/registry";
-import { resolveEffectById } from "../packs/resolve";
+import {
+  findAssignment,
+  resolveEffectById,
+  resolveTemplateTrigger,
+} from "../packs/resolve";
 import type { ReactionPack } from "../packs/packSchemas";
+import type { MomentType } from "../detector/MomentDetector";
 import type { TriggerEvent } from "../trigger/TriggerEvent";
 import { assertNever } from "../trigger/TriggerEvent";
 import {
@@ -11,6 +16,7 @@ import {
   isTriggerContractEvent,
   toLegacyTrigger,
   type TriggerContractEvent,
+  type TriggerSource,
 } from "../trigger/triggerSchemas";
 
 /**
@@ -18,15 +24,14 @@ import {
  * (AI detector, manual console, timer/hotkey, future API) through the
  * shared compose path.
  *
- * M2: accepts both the legacy `TriggerEvent` and the validated
- * `TriggerContractEvent`. Contract events are normalised to the legacy
- * shape the canvas composer already understands; effect triggers are
- * resolved via the active pack first, then the static registry.
- * Expired triggers are dropped.
- *
- * M6: only `frame` effects compose locally (they have template art).
- * Media effects resolve to their effect record so callers can publish
- * them; the canvas path stays PNG-only by design.
+ * Every trigger funnels through the pack-aware rules in
+ * `src/packs/resolve.ts`, so manual, camera, timer and hotkey sources all
+ * share one matching order: pack assignment first, V1 static fallback
+ * second. Contract events are normalised to the legacy shape the canvas
+ * composer already understands; effect triggers are resolved via the
+ * active pack first, then the static registry. Expired triggers are
+ * dropped, media-only effects are left for the OBS relay (never faked as
+ * PNGs).
  */
 export type AnyTrigger = TriggerEvent | TriggerContractEvent;
 
@@ -43,9 +48,49 @@ function normalise(input: AnyTrigger, pack?: ReactionPack | null): TriggerEvent 
       const template = getTemplateForEffect(effect);
       return { source: "manual", templateId: template.id, at: input.timestamp };
     }
-    return toLegacyTrigger(input);
+    if (input.triggerType === "moment") {
+      const assigned = momentAssignment(input.moment, input.source, pack);
+      if (assigned === "media") throw new MediaEffectError(`moment:${input.moment}`);
+      if (assigned) {
+        return { source: "manual", templateId: assigned.id, at: input.timestamp };
+      }
+      return toLegacyTrigger(input);
+    }
+    // Template triggers share the manual rule with legacy buttons.
+    const resolved = resolveTemplateTrigger(input.templateId, input.source, pack);
+    if (resolved.kind === "media") {
+      throw new MediaEffectError(resolved.effect.id);
+    }
+    return { source: "manual", templateId: resolved.template.id, at: input.timestamp };
+  }
+  if (input.source === "manual") {
+    const resolved = resolveTemplateTrigger(input.templateId, "manual", pack);
+    if (resolved.kind === "media") {
+      throw new MediaEffectError(resolved.effect.id);
+    }
+    return { source: "manual", templateId: resolved.template.id, at: input.at };
+  }
+  const assigned = momentAssignment(input.moment, "ai-detector", pack);
+  if (assigned === "media") throw new MediaEffectError(`moment:${input.moment}`);
+  if (assigned) {
+    return { source: "manual", templateId: assigned.id, at: input.at };
   }
   return input;
+}
+
+/**
+ * Assigned frame template id, "media" for assigned media effects, null when
+ * nothing matches. One rule for every source.
+ */
+function momentAssignment(
+  moment: MomentType,
+  source: TriggerSource,
+  pack?: ReactionPack | null
+): { id: string } | "media" | null {
+  const assigned = findAssignment(moment, source, pack);
+  if (!assigned) return null;
+  if (assigned.kind === "frame") return { id: assigned.templateId };
+  return "media";
 }
 
 export class ExpiredTriggerError extends Error {

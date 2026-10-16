@@ -26,9 +26,13 @@ interface Fired {
 function Harness({
   fired,
   relayReady = true,
+  relayBase = "http://127.0.0.1:4190",
+  publishToken = "",
 }: {
   fired: Fired[];
   relayReady?: boolean;
+  relayBase?: string;
+  publishToken?: string;
 }) {
   const [library, setLibrary] = useState<PackLibrary>(emptyLibrary());
   const [media] = useState(() => new MediaRegistry());
@@ -40,6 +44,8 @@ function Harness({
       media={media}
       onMediaChange={() => setVersion((v) => v + 1)}
       relayReady={relayReady}
+      relayBase={relayBase}
+      publishToken={publishToken}
       onFireEffect={(effect, pack) => {
         fired.push({ effect, pack });
       }}
@@ -47,9 +53,9 @@ function Harness({
   );
 }
 
-function setup(relayReady = true) {
+function setup(relayReady = true, relayBase = "http://127.0.0.1:4190", publishToken = "") {
   const fired: Fired[] = [];
-  const utils = render(<Harness fired={fired} relayReady={relayReady} />);
+  const utils = render(<Harness fired={fired} relayReady={relayReady} relayBase={relayBase} publishToken={publishToken} />);
   return { ...utils, fired };
 }
 
@@ -244,6 +250,134 @@ describe("ReactionEditor workflow (M6)", () => {
     });
     await waitFor(() => {
       expect(screen.getByRole("option", { name: /ExportMe/ })).toBeTruthy();
+    });
+  });
+});
+
+describe("ReactionEditor relay transfer (M6.1)", () => {
+  beforeEach(() => {
+    vi.stubGlobal("URL", {
+      ...URL,
+      createObjectURL: vi.fn(() => "blob:mock-url"),
+      revokeObjectURL: vi.fn(),
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  function relayFetch(state: { inventory: string[]; uploads: string[]; deletes: string[] }) {
+    const ok = (body: unknown, status = 200) =>
+      ({ ok: status >= 200 && status < 300, status, json: async () => body }) as Response;
+    const err = (status: number, body: unknown) =>
+      ({ ok: false, status, json: async () => body }) as Response;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        const u = String(url);
+        const method = (init?.method ?? "GET").toUpperCase();
+        if (u.endsWith("/api/media") && method === "GET") {
+          return ok({ media: state.inventory.map((name) => ({ name, bytes: 10, kind: "audio" })) });
+        }
+        if (u.includes("/api/media/") && method === "POST") {
+          const name = decodeURIComponent(u.split("/api/media/")[1] ?? "");
+          if (state.inventory.includes(name)) return err(409, { error: "exists" });
+          state.inventory.push(name);
+          state.uploads.push(name);
+          return ok({ name, bytes: 10, kind: "audio" }, 201);
+        }
+        if (u.includes("/api/media/") && method === "DELETE") {
+          const name = decodeURIComponent(u.split("/api/media/")[1] ?? "");
+          const idx = state.inventory.indexOf(name);
+          if (idx < 0) return err(404, { error: "not found" });
+          state.inventory.splice(idx, 1);
+          state.deletes.push(name);
+          return ok({ removed: true, name });
+        }
+        return err(404, { error: "not found" });
+      })
+    );
+    return state;
+  }
+
+  it("streams imports to the relay automatically when a token is present", async () => {
+    const state = relayFetch({ inventory: [], uploads: [], deletes: [] });
+    setup(true, "http://127.0.0.1:4190", "token");
+    createPackNamed("Transfer Pack");
+    fireEvent.change(screen.getByLabelText("Import media files"), {
+      target: { files: [wavFile()] },
+    });
+    await waitFor(() => {
+      expect(screen.getByText("sting.wav")).toBeTruthy();
+    });
+    await waitFor(() => {
+      expect(screen.getAllByText(/on relay/i).length).toBeGreaterThan(0);
+    });
+    expect(state.uploads).toContain("sting.wav");
+    expect(screen.getByText(/Refresh relay files/i)).toBeTruthy();
+  });
+
+  it("keeps imports local without a token and offers manual Send to relay", async () => {
+    relayFetch({ inventory: [], uploads: [], deletes: [] });
+    setup(true);
+    createPackNamed("Local Pack");
+    fireEvent.change(screen.getByLabelText("Import media files"), {
+      target: { files: [wavFile()] },
+    });
+    await waitFor(() => {
+      expect(screen.getByText("sting.wav")).toBeTruthy();
+    });
+    expect(screen.getAllByText(/publish token/i).length).toBeGreaterThan(0);
+    // No token: no Send happens, and the button is disabled with guidance.
+    expect(screen.getByText("Send to relay")).toBeTruthy();
+    expect((screen.getByText("Send to relay") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("surfaces relay conflicts with a confirmed replace path", async () => {
+    const state = relayFetch({ inventory: ["sting.wav"], uploads: [], deletes: [] });
+    setup(true, "http://127.0.0.1:4190", "token");
+    createPackNamed("Conflict Pack");
+    fireEvent.change(screen.getByLabelText("Import media files"), {
+      target: { files: [wavFile()] },
+    });
+    await waitFor(() => {
+      expect(screen.getByText("sting.wav")).toBeTruthy();
+    });
+    await waitFor(() => {
+      expect(screen.getByText(/Already on the relay/i)).toBeTruthy();
+    });
+    expect(state.uploads).not.toContain("sting.wav");
+    // Two-step replace: arm then confirm deletes first, then uploads.
+    fireEvent.click(screen.getByText("Replace on relay"));
+    fireEvent.click(screen.getByText("Confirm replace"));
+    await waitFor(() => {
+      expect(state.deletes).toContain("sting.wav");
+    });
+    await waitFor(() => {
+      expect(state.uploads).toContain("sting.wav");
+    });
+  });
+
+  it("deletes relay copies with confirmation and refreshes inventory", async () => {
+    const state = relayFetch({ inventory: ["sting.wav"], uploads: [], deletes: [] });
+    setup(true, "http://127.0.0.1:4190", "token");
+    createPackNamed("Delete Pack");
+    fireEvent.change(screen.getByLabelText("Import media files"), {
+      target: { files: [wavFile()] },
+    });
+    await waitFor(() => {
+      expect(screen.getByText("sting.wav")).toBeTruthy();
+    });
+    // Conflict path leaves the relay copy listed; delete it explicitly.
+    await waitFor(() => {
+      expect(screen.getByText("Delete from relay")).toBeTruthy();
+    });
+    fireEvent.click(screen.getByText("Delete from relay"));
+    fireEvent.click(screen.getByText(/Confirm delete/));
+    await waitFor(() => {
+      expect(state.deletes).toContain("sting.wav");
     });
   });
 });

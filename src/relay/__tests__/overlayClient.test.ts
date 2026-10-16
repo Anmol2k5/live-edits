@@ -171,4 +171,78 @@ describe("overlayClient payload (M3)", () => {
       /Unknown effect ID/
     );
   });
+
+  it("prefers pack assignment policy over static defaults for template triggers", async () => {
+    const calls = mockFetch();
+    const { createPack } = await import("../../packs/packSchemas");
+    const pack = createPack("Policy Pack");
+    pack.effects.push({
+      id: "assigned-clip",
+      name: "Assigned",
+      kind: "video",
+      mediaFile: "clip.webm",
+      moment: "wow",
+      durationMs: 2700,
+      delayMs: 0,
+      cooldownMs: 2500,
+      priority: 90,
+      queue: "coexist",
+      enabled: true,
+      volume: 0.8,
+      position: "center",
+      entrance: "pop",
+      exit: "fade",
+      muted: false,
+    });
+    pack.assignments.push({ id: "a1", source: "manual", moment: "wow", effectId: "assigned-clip" });
+    const event = createTemplateTrigger("wow-1", { source: "manual" });
+    await publishOverlayTrigger(event, "token", "", pack);
+    // Assignment queue/priority/cooldown win over the static effect-wow-1 defaults.
+    expect(calls[0].body).toMatchObject({
+      moment: "wow",
+      templateId: "wow-1",
+      queue: "coexist",
+      priority: 90,
+      cooldownMs: 2500,
+    });
+  });
+
+  it("leaves effect volume/duration/position/trim intact when no caller override is given", async () => {
+    const calls = mockFetch();
+    const { createPack } = await import("../../packs/packSchemas");
+    const pack = createPack("Settings Pack");
+    pack.effects.push({
+      id: "tuned",
+      name: "Tuned",
+      kind: "video",
+      mediaFile: "clip.webm",
+      moment: "funny",
+      durationMs: 4100,
+      delayMs: 0,
+      cooldownMs: 1500,
+      priority: 60,
+      queue: "queue",
+      enabled: true,
+      volume: 0.25,
+      position: "top-left",
+      entrance: "pop",
+      exit: "fade",
+      muted: false,
+      clipStartMs: 100,
+      clipEndMs: 2000,
+    });
+    // Blank Live-panel fields mean no override object: effect config survives.
+    await publishOverlayTrigger(createEffectTrigger("tuned", { source: "manual" }), "token", "", pack);
+    expect(calls[0].body).toMatchObject({
+      effectId: "tuned",
+      volume: 0.25,
+      durationMs: 4100,
+      position: "top-left",
+      clipStartMs: 100,
+      clipEndMs: 2000,
+      queue: "queue",
+      priority: 60,
+      cooldownMs: 1500,
+    });
+  });
 });

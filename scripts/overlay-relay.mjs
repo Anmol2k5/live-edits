@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { readFile, stat, readdir } from "node:fs/promises";
-import { createReadStream } from "node:fs";
+import { readFile, stat, readdir, open, rename, unlink, mkdir } from "node:fs/promises";
+import { createReadStream, createWriteStream, mkdirSync } from "node:fs";
 import { resolve, join, extname, basename, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -36,6 +36,28 @@ function validMedia(name){
 function insideDir(dir,file){
   const target=resolve(join(dir,file));
   return target===resolve(dir)||target.startsWith(resolve(dir)+sep) ? target : null;
+}
+/** Content sniffing: magic bytes must agree with the claimed extension. */
+function sniffKind(head,ext){
+  const has=(...bytes)=>bytes.every((b,i)=>head[i]===b);
+  const ascii=(offset,text)=>head.subarray(offset,offset+text.length).toString("binary")===text;
+  if(ext===".png")return has(0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A)?"image":null;
+  if(ext===".jpg"||ext===".jpeg")return has(0xFF,0xD8,0xFF)?"image":null;
+  if(ext===".gif")return ascii(0,"GIF87a")||ascii(0,"GIF89a")?"image":null;
+  if(ext===".webp")return ascii(0,"RIFF")&&ascii(8,"WEBP")?"image":null;
+  if(ext===".mp4"||ext===".m4v")return ascii(4,"ftyp")?"video":null;
+  if(ext===".webm"||ext===".mkv")return has(0x1A,0x45,0xDF,0xA3)?"video":null;
+  if(ext===".mp3")return ascii(0,"ID3")||(head[0]===0xFF&&(head[1]&0xE0)===0xE0)?"audio":null;
+  if(ext===".wav")return ascii(0,"RIFF")&&ascii(8,"WAVE")?"audio":null;
+  if(ext===".ogg"||ext===".oga")return ascii(0,"OggS")?"audio":null;
+  return null;
+}
+function kindForExt(ext){
+  const mime=MIME[ext];
+  if(!mime)return null;
+  if(mime.startsWith("video"))return "video";
+  if(mime.startsWith("audio"))return "audio";
+  return "image";
 }
 function optString(value,min,max){
   return typeof value==="string"&&value.length>=min&&value.length<=max;
@@ -166,6 +188,7 @@ export function createOverlayRelay({
   const bootId=randomBytes(8).toString("hex");
   const clients=new Set();
   const seenDedup=new Map();
+  const uploadsInFlight=new Set();
   let sequence=0;
   const noteDedup=(key)=>{
     if(key==null)return true;
@@ -177,6 +200,7 @@ export function createOverlayRelay({
     }
     return true;
   };
+  try{mkdirSync(mediaDirectory,{recursive:true});}catch{}
   const server=createServer(async(req,res)=>{
     try{
       const url=new URL(req.url||"/","http://127.0.0.1");
@@ -186,7 +210,7 @@ export function createOverlayRelay({
         res.setHeader("Access-Control-Allow-Origin",origin);
         res.setHeader("Vary","Origin");
         res.setHeader("Access-Control-Allow-Headers","Authorization, Content-Type");
-        res.setHeader("Access-Control-Allow-Methods","GET, POST, OPTIONS");
+        res.setHeader("Access-Control-Allow-Methods","GET, POST, DELETE, OPTIONS");
       }
       if(req.method==="OPTIONS"){res.writeHead(204);return res.end();}
       if(req.method==="GET"&&url.pathname==="/api/health"){
@@ -206,11 +230,97 @@ export function createOverlayRelay({
           const info=await stat(full).catch(()=>null);
           if(!info?.isFile())continue;
           const ext=extname(name).toLowerCase();
-          items.push({name,bytes:info.size,
-            kind:MIME[ext]?.startsWith("video")?"video":MIME[ext]?.startsWith("audio")?"audio":"image"});
+          items.push({name,bytes:info.size,kind:kindForExt(ext)??"image"});
         }
         items.sort((a,b)=>a.name.localeCompare(b.name));
         return json(res,200,{media:items});
+      }
+      if(req.method==="POST"&&url.pathname.startsWith("/api/media/")){
+        // Authenticated media import. Streams the body to a temp file
+        // (bounded memory), validates size/name/content, then atomically
+        // renames. Never overwrites: existing names get 409.
+        if(!authorized(req.headers.authorization?.replace(/^Bearer /,""),publishToken))return json(res,401,{error:"unauthorized"});
+        const name=basename(url.pathname);
+        if(url.pathname!=="/api/media/"+name||!validMedia(name))return json(res,400,{error:"invalid filename"});
+        const full=insideDir(mediaDirectory,name);
+        if(!full)return json(res,400,{error:"invalid filename"});
+        const declared=Number(req.headers["content-length"]);
+        if(Number.isFinite(declared)&&declared>MAX_FILE_BYTES)return json(res,413,{error:"file too large"});
+        if(uploadsInFlight.has(name)){
+          for await(const _chunk of req){}
+          return json(res,409,{error:"upload in progress"});
+        }
+        uploadsInFlight.add(name);
+        try{
+          const existing=await stat(full).catch(()=>null);
+          if(existing?.isFile()){
+            for await(const _chunk of req){}
+            const info=await stat(full);
+            return json(res,409,{error:"exists",existing:{name,bytes:info.size}});
+          }
+          const tmp=join(mediaDirectory,".upload-"+randomBytes(8).toString("hex")+".part");
+          const cleanup=async()=>{await unlink(tmp).catch(()=>{});};
+          let received=0;
+          let streamError=null;
+          try{
+            const out=createWriteStream(tmp);
+            const finished=new Promise((ok,bad)=>{out.on("finish",ok);out.on("error",bad);});
+            try{
+              for await(const chunk of req){
+                received+=chunk.length;
+                if(received<=MAX_FILE_BYTES){
+                  if(!out.write(chunk))await new Promise((r)=>out.once("drain",r));
+                }
+              }
+            }catch(error){
+              streamError=error;
+            }
+            try{out.end();}catch{}
+            if(!streamError){
+              try{await finished;}catch(error){streamError=error;}
+            }
+          }catch(error){
+            streamError=error;
+          }
+          if(streamError){
+            await cleanup();
+            return;
+          }
+          if(received===0){await cleanup();return json(res,400,{error:"empty file"});}
+          if(received>MAX_FILE_BYTES){await cleanup();return json(res,413,{error:"file too large"});}
+          const raced=await stat(full).catch(()=>null);
+          if(raced?.isFile()){await cleanup();return json(res,409,{error:"exists"});}
+          const ext=extname(name).toLowerCase();
+          let head=null;
+          try{
+            const handle=await open(tmp,"r");
+            try{
+              const buffer=Buffer.alloc(32);
+              const {bytesRead}=await handle.read(buffer,0,32,0);
+              head=buffer.subarray(0,bytesRead);
+            }finally{
+              await handle.close().catch(()=>{});
+            }
+          }catch{}
+          if(!head||head.length===0||sniffKind(head,ext)!==kindForExt(ext)){
+            await cleanup();
+            return json(res,400,{error:"content does not match the filename"});
+          }
+          await rename(tmp,full);
+          return json(res,201,{name,bytes:received,kind:kindForExt(ext)});
+        }finally{
+          uploadsInFlight.delete(name);
+        }
+      }
+      if(req.method==="DELETE"&&url.pathname.startsWith("/api/media/")){
+        if(!authorized(req.headers.authorization?.replace(/^Bearer /,""),publishToken))return json(res,401,{error:"unauthorized"});
+        const name=basename(url.pathname);
+        if(url.pathname!=="/api/media/"+name||!validMedia(name))return json(res,400,{error:"invalid filename"});
+        const full=insideDir(mediaDirectory,name);
+        if(!full)return json(res,400,{error:"invalid filename"});
+        const removed=await unlink(full).then(()=>true).catch(()=>false);
+        if(!removed)return json(res,404,{error:"not found"});
+        return json(res,200,{removed:true,name});
       }
       if(req.method==="GET"&&url.pathname==="/overlay"){
         if(!authorized(url.searchParams.get("token"),viewToken))return json(res,403,{error:"forbidden"});
@@ -311,13 +421,20 @@ export function createOverlayRelay({
   return {server,listen,close,publishToken,viewToken,bootId};
 }
 if(process.argv[1]&&import.meta.url===pathToFileURL(resolve(process.argv[1])).href){
+  const args=process.argv.slice(2);
+  const flagIndex=args.indexOf("--media-dir");
+  const mediaDirectory=
+    process.env.LIVE_EDITS_MEDIA_DIR ||
+    (flagIndex>=0&&args[flagIndex+1] ? resolve(args[flagIndex+1]) : undefined);
   const relay=createOverlayRelay({
     publishToken:process.env.LIVE_EDITS_PUBLISH_TOKEN||undefined,
-    viewToken:process.env.LIVE_EDITS_VIEW_TOKEN||undefined
+    viewToken:process.env.LIVE_EDITS_VIEW_TOKEN||undefined,
+    ...(mediaDirectory?{mediaDirectory}:{}),
   });
   const address=await relay.listen();
   console.log("Live Edits development relay running at http://127.0.0.1:"+address.port);
   console.log("Desktop PUBLISH token (do not share): "+relay.publishToken);
   console.log("OBS Browser Source URL (keep private): http://127.0.0.1:"+address.port+"/overlay?token="+relay.viewToken);
-  console.log("To play custom video/audio, place files in public/reactions/ and enter their filename in the desktop UI.");
+  console.log("Media directory (user-writable, loopback uploads only): "+(mediaDirectory||join(ROOT,"public","reactions")));
+  console.log("Import media from the desktop Editor — files no longer need manual copying.");
 }

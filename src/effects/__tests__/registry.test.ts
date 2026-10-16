@@ -16,6 +16,7 @@ import {
   createTemplateTrigger,
   createEffectTrigger,
 } from "../../trigger/triggerSchemas";
+import { createPack } from "../../packs/packSchemas";
 
 const { mockCompose, mockCaptureFrame } = vi.hoisted(() => ({
   mockCompose: vi.fn(),
@@ -105,5 +106,108 @@ describe("effect registry + pipeline resolution (M2)", () => {
       });
     });
     expect(mockCompose).toHaveBeenCalledTimes(1);
+  });
+
+  it("routes pack assignments to the assigned frame, not a random one", () => {
+    const pack = createPack("p");
+    pack.effects.push({
+      id: "frame-1",
+      name: "F",
+      kind: "frame",
+      templateId: "wow-2",
+      moment: "wow",
+      durationMs: 8000,
+      delayMs: 0,
+      cooldownMs: 0,
+      priority: 50,
+      queue: "replace",
+      enabled: true,
+      zIndex: 100,
+      opacity: 1,
+    });
+    pack.assignments.push({ id: "a1", source: "manual", moment: "wow", effectId: "frame-1" });
+    pack.assignments.push({ id: "a2", source: "ai-detector", moment: "wow", effectId: "frame-1" });
+    // Manual button for wow-1 resolves to the assigned wow-2 template.
+    expect(
+      resolveToLegacy({ source: "manual", templateId: "wow-1", at: 1000 }, pack)
+    ).toEqual({ source: "manual", templateId: "wow-2", at: 1000 });
+    // Detector moments resolve through the same rule with their own source.
+    expect(
+      resolveToLegacy(
+        createMomentTrigger("wow", { source: "ai-detector", timestamp: 1000 }),
+        pack
+      )
+    ).toEqual({ source: "manual", templateId: "wow-2", at: 1000 });
+    // A detector trigger does NOT match a manual-only assignment.
+    const manualOnly = createPack("m");
+    manualOnly.effects.push({
+      id: "frame-9",
+      name: "F9",
+      kind: "frame",
+      templateId: "wow-2",
+      moment: "wow",
+      durationMs: 8000,
+      delayMs: 0,
+      cooldownMs: 0,
+      priority: 50,
+      queue: "replace",
+      enabled: true,
+      zIndex: 100,
+      opacity: 1,
+    });
+    manualOnly.assignments.push({ id: "a1", source: "manual", moment: "wow", effectId: "frame-9" });
+    expect(
+      resolveToLegacy(
+        createMomentTrigger("wow", { source: "ai-detector", timestamp: 1000 }),
+        manualOnly
+      )
+    ).toEqual({
+      source: "ai-detector",
+      moment: "wow",
+      confidence: 0,
+      at: 1000,
+    });
+    // Without a pack the requested template plays unchanged (V1).
+    expect(
+      resolveToLegacy({ source: "manual", templateId: "wow-1", at: 1000 }, undefined)
+    ).toEqual({ source: "manual", templateId: "wow-1", at: 1000 });
+  });
+
+  it("leaves pack media effects for the OBS relay (never faked as PNGs)", () => {
+    mockCaptureFrame.mockReturnValue({} as unknown as HTMLCanvasElement);
+    mockCompose.mockClear();
+    mockCompose.mockResolvedValue(new Blob(["x"], { type: "image/png" }));
+    const pack = createPack("p");
+    pack.effects.push({
+      id: "clip-1",
+      name: "Clip",
+      kind: "video",
+      mediaFile: "clip.webm",
+      moment: "wow",
+      durationMs: 2700,
+      delayMs: 0,
+      cooldownMs: 0,
+      priority: 50,
+      queue: "replace",
+      enabled: true,
+      volume: 1,
+      position: "center",
+      entrance: "pop",
+      exit: "fade",
+      muted: false,
+    });
+    pack.assignments.push({ id: "a1", source: "manual", moment: "wow", effectId: "clip-1" });
+    const { result } = renderHook(() => useEditPipeline());
+    act(() => {
+      result.current.fireTrigger(
+        {} as HTMLVideoElement,
+        { source: "manual", templateId: "wow-1", at: Date.now() },
+        pack
+      );
+    });
+    expect(mockCompose).not.toHaveBeenCalled();
+    expect(() =>
+      resolveToLegacy(createEffectTrigger("clip-1", { source: "manual" }), pack)
+    ).toThrow(/media-only/);
   });
 });

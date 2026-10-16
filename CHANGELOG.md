@@ -1,5 +1,32 @@
 # Changelog
 
+## M6.1 — Finish the reaction-pack workflow (branch feature/obs-reaction-mvp)
+
+Scope: master-prompt Milestone 6.1 only (recovered after an interrupted session; no restart from scratch). No merge of PR #1, no deploy, no SaaS/billing/Twitch, no release claim.
+
+### Automatic media transfer (no manual copying)
+
+- Relay `POST /api/media/:name` (publish-token auth, 50 MB cap, filename allowlist, traversal containment, magic-byte content sniffing, streaming to temp file with bounded memory, atomic rename, 409 on duplicates or in-flight uploads, empty/oversize rejected, temp fragments cleaned on abort) plus `GET /api/media` inventory and `DELETE /api/media/:name` explicit removal. User-writable media directory via `LIVE_EDITS_MEDIA_DIR` / `--media-dir` (defaults to `public/reactions`). Covered by relay tests including 1 MB streaming and abort cleanup.
+- Client `src/relay/mediaTransfer.ts`: streaming `uploadMedia`, `deleteRelayMedia`, `fetchRelayInventory` with typed `MediaTransferError`; never buffers whole files client-side.
+- Editor wiring: imports stream to the relay automatically when the publish token is set; without a token they stay local with a manual Send to relay retry. Per-file status (sending / on relay / local only / conflict / error), confirmed Replace (delete-then-upload) on 409, confirmed Delete from relay, Refresh relay files inventory, reload-aware preview messaging (relay copies still fire after reload; local preview needs reimport). `src/editor/ReactionEditor.tsx`, `src/editor/MediaLibraryPanel.tsx`, `src/App.tsx` passes `relayBase` + `publishToken` into the editor.
+
+### Active-pack trigger resolution (V1 fallback preserved)
+
+- Manual buttons and facial-expression detector events resolve through `findAssignment` / `resolveTemplateTrigger` with the same pack-first rule as the pipeline; frame assignments compose the assigned template, media assignments publish an effect trigger with no local PNG fakery, unmatched triggers keep exact V1 behavior. Source wildcards (assignments with no moment) match any moment for their source after exact rules, so timer/hotkey generic entries work without shadowing specifics.
+
+### Effect settings survival (no global overrides)
+
+- Pack media effects publish full playback config (media file, duration, volume, trim, position, queue, priority, cooldown, effect identity); frame effects keep the legacy template path with relay defaults. Blank Live-panel volume/duration/media fields mean no override. Pinned by overlay-client mapping tests.
+
+### Collision handling
+
+- Duplicate pack IDs get a fresh ID plus "(imported)" suffix so reimports never collide; colliding effect IDs take `-imported-N` with assignment/sequence references rewritten. Reimported filenames release stale object URLs; async probe results apply only to the still-current URL (stale rejected). Destructive relay replaces and used-media/pack/effect deletes use two-step confirms.
+
+### Verification (actual runs, this environment)
+
+- `npm run typecheck` clean; `npm run test` 164/164 passed (28 files); `npm run test:relay` 17/17 passed; `npm run test:e2e` 14/14 passed (playback 12 incl. new transfer + reload-persistence workflow, autoplay-default 2); `npm run build` success; `npm audit` 0 vulnerabilities (see below); Tauri packaging BLOCKED (no cargo/rustc); physical OBS/webcam NOT TESTED here.
+- End-to-end workflow proven in real Chromium: create pack, import transfer.wav (outside the relay dir), auto-transfer, effect, manual wow assignment, save, activate, Live wow-1 trigger plays `/media/transfer.wav` on the real overlay, cleanup delete, reload plays again with no reimport.
+
 ## M6 — Reaction packs & effect editor (branch feature/obs-reaction-mvp)
 
 Scope: master-prompt Milestone 6 only. No SaaS accounts/billing, no merge, no deploy, no release claim. Foundation (M0–M5) preserved; editor is additive (`src/editor/`, `src/packs/`) plus narrow pack-aware wiring in the pipeline, publisher and App.

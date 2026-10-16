@@ -1,10 +1,12 @@
 import { getTemplateById } from "../templates/templates";
-import { resolveEffectById, resolveTemplateForEffect } from "../packs/resolve";
+import { findAssignment, resolveEffectById, resolveTemplateForEffect } from "../packs/resolve";
 import type { ReactionPack } from "../packs/packSchemas";
+import type { MomentType } from "../detector/MomentDetector";
 import type { TriggerEvent } from "../trigger/TriggerEvent";
 import {
   isTriggerContractEvent,
   type TriggerContractEvent,
+  type TriggerSource,
 } from "../trigger/triggerSchemas";
 
 const DEFAULT_RELAY = "http://127.0.0.1:4190";
@@ -76,13 +78,19 @@ function buildPayload(
       case "moment": {
         payload.moment = input.moment;
         payload.templateId = `${input.moment}-1`;
-        attachPolicy(payload, `effect-${input.moment}-1`, pack);
+        attachPolicy(payload, `effect-${input.moment}-1`, pack, input.moment, input.source);
         break;
       }
       case "template": {
         payload.templateId = input.templateId;
         payload.moment = getTemplateById(input.templateId).moment;
-        attachPolicy(payload, `effect-${input.templateId}`, pack);
+        attachPolicy(
+          payload,
+          `effect-${input.templateId}`,
+          pack,
+          payload.moment as MomentType,
+          input.source
+        );
         break;
       }
       case "effect": {
@@ -93,11 +101,17 @@ function buildPayload(
   } else if (input.source === "manual") {
     payload.moment = getTemplateById(input.templateId).moment;
     payload.templateId = input.templateId;
-    attachPolicy(payload, `effect-${input.templateId}`, pack);
+    attachPolicy(
+      payload,
+      `effect-${input.templateId}`,
+      pack,
+      payload.moment as MomentType,
+      "manual"
+    );
   } else {
     payload.moment = input.moment;
     payload.templateId = `${input.moment}-1`;
-    attachPolicy(payload, `effect-${input.moment}-1`, pack);
+    attachPolicy(payload, `effect-${input.moment}-1`, pack, input.moment, input.source);
   }
   if (mediaFile) payload.mediaFile = mediaFile;
   if (opts.durationMs !== undefined) payload.durationMs = opts.durationMs;
@@ -111,8 +125,21 @@ function buildPayload(
 function attachPolicy(
   payload: Record<string, unknown>,
   effectId: string,
-  pack?: ReactionPack | null
+  pack?: ReactionPack | null,
+  moment?: MomentType,
+  source?: TriggerSource
 ): void {
+  // Pack assignments share the pipeline's matching rule: an assigned
+  // effect's policy wins over the static template default.
+  if (moment !== undefined && source !== undefined) {
+    const assigned = findAssignment(moment, source, pack);
+    if (assigned) {
+      payload.queue = assigned.queue;
+      payload.priority = assigned.priority;
+      payload.cooldownMs = assigned.cooldownMs;
+      return;
+    }
+  }
   try {
     const effect = resolveEffectById(effectId, pack);
     payload.queue = effect.queue;

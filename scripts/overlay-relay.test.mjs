@@ -1,9 +1,37 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { request as httpRequest } from "node:http";
 import { createOverlayRelay } from "./overlay-relay.mjs";
+
+function wavBytes(payloadSize, fill = 7) {
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + payloadSize, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(22050, 24);
+  header.writeUInt32LE(44100, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(payloadSize, 40);
+  return Buffer.concat([header, Buffer.alloc(payloadSize, fill)]);
+}
+
+function pngBytes(payloadSize) {
+  const head = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  return Buffer.concat([head, Buffer.alloc(payloadSize, 3)]);
+}
+
+function residue(dir) {
+  return readdirSync(dir).filter((n) => n.startsWith(".upload-") && n.endsWith(".part"));
+}
 
 test("local OBS bridge authenticates, validates and delivers a reaction", async () => {
   const relay=createOverlayRelay({publishToken:"publish-test-token",viewToken:"view-test-token"});
@@ -246,6 +274,137 @@ test("relay issues the private OBS url only to the publish-token holder", async 
     assert.match(body.url,/^http:\/\/127\.0\.0\.1:\d+\/overlay\?token=v-token$/);
     const overlay=await fetch(body.url);
     assert.equal(overlay.status,200,"issued url loads the overlay");
+    await overlay.arrayBuffer().catch(()=>{});
+  } finally {
+    await relay.close();
+  }
+});
+
+test("relay imports media over an authenticated streaming upload", async () => {
+  const mediaDir=mkdtempSync(join(tmpdir(),"reactions-"));
+  const relay=createOverlayRelay({publishToken:"p-token",viewToken:"v-token",mediaDirectory:mediaDir});
+  const address=await relay.listen(0);
+  const base="http://127.0.0.1:"+address.port;
+  const auth={Authorization:"Bearer p-token"};
+  const drain=async(response)=>{await response.arrayBuffer().catch(()=>{});return response;};
+  try {
+    const payload=wavBytes(4096);
+    let response=await fetch(base+"/api/media/sting.wav",{method:"POST",headers:{...auth,"Content-Type":"audio/wav"},body:payload});
+    assert.equal(response.status,201,"valid upload is stored");
+    assert.deepEqual(await response.json(),{name:"sting.wav",bytes:payload.length,kind:"audio"});
+
+    response=await fetch(base+"/media/sting.wav");
+    assert.equal(response.status,200,"uploaded file plays back");
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()),payload,"round-trip is byte-identical");
+
+    response=await fetch(base+"/api/media",{headers:auth});
+    assert.deepEqual((await response.json()).media.map((m)=>m.name),["sting.wav"],"inventory lists the upload");
+
+    // Duplicate names are refused, never silently overwritten.
+    response=await fetch(base+"/api/media/sting.wav",{method:"POST",headers:{...auth,"Content-Type":"audio/wav"},body:wavBytes(100,9)});
+    assert.equal(response.status,409,"existing names are not overwritten");
+    assert.equal((await response.json()).error,"exists");
+    response=await fetch(base+"/media/sting.wav");
+    assert.equal((await response.arrayBuffer()).byteLength,payload.length,"original bytes survive the conflict");
+
+    // Auth, names and content are enforced at the boundary.
+    response=await fetch(base+"/api/media/fresh.wav",{method:"POST",headers:{"Content-Type":"audio/wav"},body:wavBytes(10)});
+    assert.equal(response.status,401,"uploads need the publish token");
+    response=await fetch(base+"/api/media/..%2Fevil.wav",{method:"POST",headers:{...auth,"Content-Type":"audio/wav"},body:wavBytes(10)});
+    assert.equal(response.status,400,"traversal names are rejected");
+    response=await fetch(base+"/api/media/tune.mp3",{method:"POST",headers:{...auth,"Content-Type":"audio/mpeg"},body:pngBytes(100)});
+    assert.equal(response.status,400,"content must match the extension");
+    response=await fetch(base+"/api/media/empty.wav",{method:"POST",headers:{...auth,"Content-Type":"audio/wav"},body:Buffer.alloc(0)});
+    assert.equal(response.status,400,"empty uploads are rejected");
+    await drain(response);
+
+    // Oversize uploads die before touching the directory (raw request:
+    // undici refuses to send a mismatched Content-Length itself).
+    const oversizeStatus = await new Promise((resolve) => {
+      const address = new URL(base);
+      const req = httpRequest(
+        {
+          host: "127.0.0.1",
+          port: Number(address.port),
+          path: "/api/media/huge.webm",
+          method: "POST",
+          headers: {
+            Authorization: "Bearer p-token",
+            "Content-Type": "video/webm",
+            "Content-Length": String(60 * 1024 * 1024),
+          },
+        },
+        (res) => {
+          res.resume();
+          res.on("end", () => resolve(res.statusCode));
+        }
+      );
+      req.on("error", () => resolve(-1));
+      req.end(wavBytes(10));
+    });
+    assert.equal(oversizeStatus, 413, "declared oversize is rejected up front");
+    response = await fetch(base + "/media/huge.webm");
+    assert.equal(response.status, 404, "nothing was stored for the rejected upload");
+    await drain(response);
+
+    // Removal is explicit and authenticated.
+    response=await fetch(base+"/api/media/sting.wav",{method:"DELETE"});
+    assert.equal(response.status,401,"deletes need the publish token");
+    response=await fetch(base+"/api/media/sting.wav",{method:"DELETE",headers:auth});
+    assert.equal(response.status,200,"explicit delete removes the file");
+    response=await fetch(base+"/media/sting.wav");
+    assert.equal(response.status,404);
+    response=await fetch(base+"/api/media/sting.wav",{method:"DELETE",headers:auth});
+    assert.equal(response.status,404,"second delete reports missing");
+
+    // Re-upload after delete works (the supported replace flow).
+    response=await fetch(base+"/api/media/sting.wav",{method:"POST",headers:{...auth,"Content-Type":"audio/wav"},body:wavBytes(200,9)});
+    assert.equal(response.status,201,"re-upload after delete succeeds");
+    await drain(response);
+    assert.deepEqual(residue(mediaDir),[],"no temp fragments remain");
+  } finally {
+    await relay.close();
+  }
+});
+
+test("relay streams a 1 MB upload without buffering it whole", async () => {
+  const mediaDir=mkdtempSync(join(tmpdir(),"reactions-"));
+  const relay=createOverlayRelay({publishToken:"p-token",viewToken:"v-token",mediaDirectory:mediaDir});
+  const address=await relay.listen(0);
+  const base="http://127.0.0.1:"+address.port;
+  try {
+    const payload=wavBytes(1024*1024-44);
+    const response=await fetch(base+"/api/media/big.wav",{method:"POST",
+      headers:{Authorization:"Bearer p-token","Content-Type":"audio/wav"},body:payload});
+    assert.equal(response.status,201);
+    assert.equal((await response.json()).bytes,payload.length);
+    const back=await fetch(base+"/media/big.wav");
+    assert.deepEqual(Buffer.from(await back.arrayBuffer()),payload);
+  } finally {
+    await relay.close();
+  }
+});
+
+test("relay cleans up after an aborted upload", async () => {
+  const mediaDir=mkdtempSync(join(tmpdir(),"reactions-"));
+  const relay=createOverlayRelay({publishToken:"p-token",viewToken:"v-token",mediaDirectory:mediaDir});
+  const address=await relay.listen(0);
+  const port=typeof address==="object"&&address?address.port:4190;
+  try {
+    await new Promise((resolve)=>{
+      const req=httpRequest({host:"127.0.0.1",port,path:"/api/media/half.wav",method:"POST",
+        headers:{Authorization:"Bearer p-token","Content-Type":"audio/wav","Content-Length":String(5*1024*1024)}},
+        (res)=>{res.resume();res.on("end",resolve);});
+      req.on("error",()=>resolve());
+      req.write(wavBytes(1024));
+      setTimeout(()=>req.destroy(),100);
+      setTimeout(resolve,2000);
+    });
+    await new Promise((r)=>setTimeout(r,300));
+    assert.deepEqual(residue(mediaDir),[],"aborted uploads leave no fragments");
+    const missing=await fetch(`${"http://127.0.0.1"}:${port}/media/half.wav`);
+    assert.equal(missing.status,404,"aborted uploads are never published");
+    await missing.arrayBuffer().catch(()=>{});
   } finally {
     await relay.close();
   }

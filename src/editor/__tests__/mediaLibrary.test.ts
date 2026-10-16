@@ -4,6 +4,7 @@ import {
   searchMedia,
   MediaRegistry,
   probeMediaMetadata,
+  applyProbeResult,
   type MediaRecord,
 } from "../mediaLibrary";
 
@@ -76,6 +77,57 @@ describe("media import validation (M6)", () => {
   it("probe falls back to nulls instead of rejecting", async () => {
     const meta = await probeMediaMetadata("blob:unplayable", "video", 50);
     expect(meta).toEqual({ width: null, height: null, durationMs: null });
+  });
+
+  it("revokes the stale url when a filename is replaced", () => {
+    const revoke = vi.fn();
+    vi.stubGlobal("URL", { ...URL, revokeObjectURL: revoke });
+    try {
+      const registry = new MediaRegistry();
+      registry.add(record("a.png"));
+      expect(revoke).not.toHaveBeenCalled();
+      registry.add({ ...record("a.png"), url: "blob:a.png-v2", bytes: 2048 });
+      expect(revoke).toHaveBeenCalledWith("blob:a.png");
+      expect(registry.get("a.png")?.url).toBe("blob:a.png-v2");
+      // Same url re-added (e.g. probe metadata refresh) revokes nothing.
+      registry.add({ ...record("a.png"), url: "blob:a.png-v2" });
+      expect(revoke).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("drops stale probe results after replacement or removal", () => {
+    const registry = new MediaRegistry();
+    registry.add(record("a.png"));
+    // Replacement wins the race: the old probe must not overwrite it.
+    registry.add({ ...record("a.png"), url: "blob:a.png-v2", width: 640 });
+    expect(
+      applyProbeResult(registry, "a.png", "blob:a.png", {
+        width: 100,
+        height: 100,
+        durationMs: null,
+      })
+    ).toBe(false);
+    expect(registry.get("a.png")?.width).toBe(640);
+    // Matching probes still apply.
+    expect(
+      applyProbeResult(registry, "a.png", "blob:a.png-v2", {
+        width: 320,
+        height: 200,
+        durationMs: null,
+      })
+    ).toBe(true);
+    expect(registry.get("a.png")?.width).toBe(320);
+    // Removal wins too.
+    registry.remove("a.png");
+    expect(
+      applyProbeResult(registry, "a.png", "blob:a.png-v2", {
+        width: 1,
+        height: 1,
+        durationMs: null,
+      })
+    ).toBe(false);
   });
 
   afterEach(() => {

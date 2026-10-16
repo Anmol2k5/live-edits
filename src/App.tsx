@@ -18,16 +18,34 @@ import {
   getActivePack,
   type PackLibrary,
 } from "./packs/packStore";
-import { resolveMomentToEffect } from "./packs/resolve";
+import {
+  findAssignment,
+  resolveTemplateTrigger,
+} from "./packs/resolve";
 import type { AnyEffect } from "./effects/effectSchemas";
 import type { ReactionPack } from "./packs/packSchemas";
 import {
   createEffectTrigger,
   createMomentTrigger,
   createTemplateTrigger,
+  isTriggerContractEvent,
 } from "./trigger/triggerSchemas";
+import type { TriggerSource } from "./trigger/triggerSchemas";
 
 type View = "live" | "editor";
+
+/** Template identity + source for button-style triggers (all sources). */
+function templateOf(input: AnyTrigger): {
+  templateId: string;
+  source: TriggerSource;
+} | null {
+  if (isTriggerContractEvent(input)) {
+    if (input.triggerType !== "template") return null;
+    return { templateId: input.templateId, source: input.source };
+  }
+  if (input.source !== "manual") return null;
+  return { templateId: input.templateId, source: "manual" };
+}
 
 export default function App() {
   const { state: cameraState, restart } = useCamera();
@@ -76,15 +94,19 @@ export default function App() {
   const [relayBase, setRelayBase] = useState(DEFAULT_RELAY_BASE);
   const [relayToken, setRelayToken] = useState("");
   const [mediaFile, setMediaFile] = useState("");
-  const [volume, setVolume] = useState("1");
+  // Blank means "no override": the effect's own volume/duration apply.
+  // A global default here would silently replace saved effect configs.
+  const [volume, setVolume] = useState("");
   const [durationMs, setDurationMs] = useState("");
   const [relayStatus, setRelayStatus] = useState("Not connected");
 
   const publishToOverlay = useCallback(
     (event: PublishableTrigger) => {
       if (!relayToken.trim()) return;
-      const parsedVolume = Number(volume);
-      const parsedDuration = Number(durationMs);
+      // Explicit overrides only: blank Live-panel fields leave the saved
+      // effect configuration untouched (no silent replacement).
+      const parsedVolume = volume.trim() === "" ? NaN : Number(volume);
+      const parsedDuration = durationMs.trim() === "" ? NaN : Number(durationMs);
       void publishOverlayTrigger(event, relayToken.trim(), {
         mediaFile,
         ...(Number.isFinite(parsedVolume) ? { volume: Math.min(1, Math.max(0, parsedVolume)) } : {}),
@@ -100,18 +122,14 @@ export default function App() {
 
   // Detector path: pack assignments win for the local preview; a pack media
   // effect skips PNG composition (nothing to composite) but still publishes
-  // so OBS plays the configured effect.
+  // so OBS plays the configured effect. Frame assignments select the
+  // assigned template — never a random built-in alternative.
   useEffect(() => {
     if (!lastEvent) return;
-    const resolved = resolveMomentToEffect(
-      lastEvent.moment,
-      "ai-detector",
-      activePack
-    );
-    const video = videoRef.current;
-    if (resolved && resolved.kind !== "frame") {
+    const assigned = findAssignment(lastEvent.moment, "ai-detector", activePack);
+    if (assigned && assigned.kind !== "frame") {
       publishToOverlay(
-        createEffectTrigger(resolved.id, {
+        createEffectTrigger(assigned.id, {
           source: "ai-detector",
           timestamp: lastEvent.at,
         })
@@ -119,8 +137,19 @@ export default function App() {
       clearLastEvent();
       return;
     }
+    const video = videoRef.current;
     if (!video) return;
 
+    if (assigned) {
+      const event = createTemplateTrigger(assigned.templateId, {
+        source: "ai-detector",
+        timestamp: lastEvent.at,
+      });
+      fireTrigger(video, event, activePack);
+      publishToOverlay(event);
+      clearLastEvent();
+      return;
+    }
     const event = createMomentTrigger(lastEvent.moment, {
       source: "ai-detector",
       confidence: lastEvent.confidence,
@@ -133,6 +162,35 @@ export default function App() {
 
   const handleManualTrigger = useCallback(
     (event: AnyTrigger) => {
+      // Manual buttons resolve through pack assignments with the same rule
+      // as the pipeline: an assigned media effect publishes an effect
+      // trigger (no local composition), an assigned frame composes exactly
+      // that template, and anything else keeps V1 behavior.
+      const template = templateOf(event);
+      if (template) {
+        const resolved = resolveTemplateTrigger(
+          template.templateId,
+          template.source,
+          activePack
+        );
+        if (resolved.kind === "media") {
+          publishToOverlay(
+            createEffectTrigger(resolved.effect.id, { source: template.source })
+          );
+          return;
+        }
+        if (resolved.kind === "frame") {
+          const assigned = createTemplateTrigger(resolved.template.id, {
+            source: template.source,
+          });
+          const video = videoRef.current;
+          if (hasValidFrame(video)) {
+            fireTrigger(video as HTMLVideoElement, assigned, activePack);
+          }
+          publishToOverlay(assigned);
+          return;
+        }
+      }
       // Camera-dependent PNG preview only when a real frame exists; the OBS
       // relay publish below works without any webcam.
       const video = videoRef.current;
@@ -233,6 +291,8 @@ export default function App() {
               media={media}
               onMediaChange={() => setMediaVersion((v) => v + 1)}
               relayReady={relayToken.trim().length > 0}
+              relayBase={relayBase}
+              publishToken={relayToken}
               onFireEffect={handleFireEffect}
             />
           </ErrorBoundary>

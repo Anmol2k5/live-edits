@@ -216,7 +216,7 @@ export function RelayPanel({
       const body = (await response.json()) as { media?: MediaItem[] };
       setMedia(body.media ?? []);
       if ((body.media ?? []).length === 0) {
-        setMediaNote("No media on the relay — drop files into public/reactions/ and restart it.");
+        setMediaNote("No media on the relay yet — import files in the Editor (they stream automatically with a token) or use Send to relay.");
       }
     } catch {
       setMediaNote("Relay unreachable — run `npm run relay` in a terminal.");
@@ -263,20 +263,21 @@ export function RelayPanel({
           />
         </label>
         <label>
-          Optional local video/audio filename (public/reactions/)
+          Optional media filename override (uses the relay inventory; blank uses the effect default)
           <input
             value={mediaFile}
             onChange={(e) => setMediaFile(e.target.value)}
-            placeholder="example.webm (blank uses PNG meme frame)"
+            placeholder="example.webm (blank uses effect media)"
           />
         </label>
         <label>
-          Volume (0–1)
+          Volume override (0–1, blank uses effect default)
           <input
             value={volume}
             onChange={(e) => setVolume(e.target.value)}
-            placeholder="1"
+            placeholder="effect default"
             inputMode="decimal"
+            aria-label="Volume override"
           />
         </label>
         <label>

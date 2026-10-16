@@ -92,10 +92,44 @@ describe("reaction packs (M6)", () => {
       assignments: [{ id: "a1", source: "manual", effectId: "vid-1" }],
       sequence: [{ id: "s1", effectId: "vid-1", delayMs: 0 }],
     });
-    const imported = importPack(incoming, existing);
+    const imported = importPack(incoming, { packIds: new Set(), effectIds: existing });
     expect(imported.effects[0]?.id).not.toBe("vid-1");
     const newId = imported.effects[0]?.id as string;
     expect(imported.assignments[0]?.effectId).toBe(newId);
     expect(imported.sequence[0]?.effectId).toBe(newId);
+  });
+
+  it("refreshes duplicate pack ids so reimports never collide", () => {
+    const first = createPack("Same");
+    const once = importPack(first, { packIds: new Set(), effectIds: new Set() });
+    expect(once.id).toBe(first.id);
+    const twice = importPack(first, {
+      packIds: new Set([first.id]),
+      effectIds: new Set(),
+    });
+    expect(twice.id).not.toBe(first.id);
+    expect(twice.name).toContain("(imported)");
+    // Effects without collisions keep their ids and references intact.
+    const withEffect = parsePack({
+      ...createPack("WithFx"),
+      effects: [
+        {
+          id: "stable-1",
+          name: "Stable",
+          kind: "video",
+          mediaFile: "clip.webm",
+          moment: "wow",
+        },
+      ],
+      assignments: [{ id: "a1", source: "manual", effectId: "stable-1" }],
+      sequence: [{ id: "s1", effectId: "stable-1", delayMs: 0 }],
+    });
+    const reimported = importPack(withEffect, {
+      packIds: new Set([withEffect.id]),
+      effectIds: new Set(),
+    });
+    expect(reimported.effects[0]?.id).toBe("stable-1");
+    expect(reimported.assignments[0]?.effectId).toBe("stable-1");
+    expect(reimported.sequence[0]?.effectId).toBe("stable-1");
   });
 });

@@ -18,8 +18,16 @@ import {
 import {
   validateMediaFile,
   probeMediaMetadata,
+  applyProbeResult,
   MediaRegistry,
 } from "./mediaLibrary";
+import {
+  uploadMedia,
+  deleteRelayMedia,
+  fetchRelayInventory,
+  MediaTransferError,
+  type RelayMediaItem,
+} from "../relay/mediaTransfer";
 import { mediaKindForFile } from "../effects/effectSchemas";
 import { useUndoable, isDirty } from "./useUndoable";
 import { useSequencePlayback } from "./useSequencePlayback";
@@ -39,8 +47,17 @@ interface ReactionEditorProps {
   media: MediaRegistry;
   onMediaChange: () => void;
   relayReady: boolean;
+  relayBase?: string;
+  publishToken?: string;
   onFireEffect: (effect: AnyEffect, pack: ReactionPack) => void;
 }
+
+export type TransferStatus =
+  | { state: "idle"; message?: string }
+  | { state: "uploading"; message?: string }
+  | { state: "on-relay"; message?: string }
+  | { state: "conflict"; message: string }
+  | { state: "error"; message: string };
 
 let stepCounter = 0;
 let assignmentCounter = 0;
@@ -60,7 +77,16 @@ function templateUrlFor(effect: AnyEffect): string {
 }
 
 export function ReactionEditor(props: ReactionEditorProps) {
-  const { library, onLibraryChange, media, onMediaChange, relayReady, onFireEffect } = props;
+  const {
+    library,
+    onLibraryChange,
+    media,
+    onMediaChange,
+    relayReady,
+    relayBase = "http://127.0.0.1:4190",
+    publishToken = "",
+    onFireEffect,
+  } = props;
 
   const [selectedPackId, setSelectedPackId] = useState<string | null>(
     library.activePackId ?? library.packs[0]?.id ?? null
@@ -77,6 +103,48 @@ export function ReactionEditor(props: ReactionEditorProps) {
   const [createError, setCreateError] = useState<string | null>(null);
   const [pendingSwitchId, setPendingSwitchId] = useState<string | null>(null);
   const [newKind, setNewKind] = useState<EffectKind>("video");
+
+  // Relay media transfer (M6.1 A): inventory + per-file upload state.
+  // File bytes are retained in-session for upload; after reload the relay
+  // copy persists on disk so saved effects still fire without reimport.
+  const [relayInventory, setRelayInventory] = useState<RelayMediaItem[] | null>(null);
+  const [relayNote, setRelayNote] = useState<string | null>(null);
+  const [transferStates, setTransferStates] = useState<Record<string, TransferStatus>>({});
+  const fileBlobs = useRef(new Map<string, File>());
+  const tokenTrimmed = publishToken.trim();
+
+  const refreshInventory = useCallback(async () => {
+    if (!tokenTrimmed) {
+      setRelayInventory(null);
+      return;
+    }
+    try {
+      const items = await fetchRelayInventory(relayBase, tokenTrimmed);
+      setRelayInventory(items);
+      setRelayNote(null);
+      setTransferStates((prev) => {
+        const next = { ...prev };
+        for (const item of items) {
+          if (!next[item.name] || next[item.name]?.state === "idle") {
+            next[item.name] = { state: "on-relay" };
+          } else if (next[item.name]?.state === "uploading") {
+            next[item.name] = { state: "on-relay" };
+          }
+        }
+        return next;
+      });
+    } catch (err) {
+      setRelayNote(err instanceof Error ? err.message : String(err));
+    }
+  }, [relayBase, tokenTrimmed]);
+
+  useEffect(() => {
+    if (!tokenTrimmed) {
+      setRelayInventory(null);
+      return;
+    }
+    void refreshInventory();
+  }, [refreshInventory, tokenTrimmed]);
 
   // Single-effect preview shares the PreviewStage with sequence playback.
   const [previewInput, setPreviewInput] = useState<PlaybackInput | null>(null);
@@ -200,8 +268,10 @@ export function ReactionEditor(props: ReactionEditorProps) {
       try {
         const text = await file.text();
         const incoming: unknown = JSON.parse(text);
-        const existingIds = new Set(library.packs.flatMap((p) => p.effects.map((e) => e.id)));
-        const pack = importPack(incoming, existingIds);
+        const pack = importPack(incoming, {
+          packIds: new Set(library.packs.map((p) => p.id)),
+          effectIds: new Set(library.packs.flatMap((p) => p.effects.map((e) => e.id))),
+        });
         const packs = [...library.packs, pack];
         persist(packs, library.activePackId);
         setSelectedPackId(pack.id);
@@ -374,11 +444,118 @@ export function ReactionEditor(props: ReactionEditorProps) {
     [updateDraft]
   );
 
-  // --- media import ----------------------------------------------------
+  // --- media import + relay transfer -----------------------------------
+  const handleUpload = useCallback(
+    async (name: string) => {
+      const file = fileBlobs.current.get(name);
+      if (!file) {
+        setTransferStates((prev) => ({
+          ...prev,
+          [name]: {
+            state: "error",
+            message: "File bytes are gone (reloaded) — reimport to upload.",
+          },
+        }));
+        return;
+      }
+      if (!tokenTrimmed) {
+        setTransferStates((prev) => ({
+          ...prev,
+          [name]: { state: "error", message: "Paste the relay publish token first." },
+        }));
+        return;
+      }
+      setTransferStates((prev) => ({ ...prev, [name]: { state: "uploading" } }));
+      try {
+        await uploadMedia(relayBase, tokenTrimmed, file, file);
+        setTransferStates((prev) => ({ ...prev, [name]: { state: "on-relay" } }));
+        await refreshInventory();
+      } catch (err) {
+        if (err instanceof MediaTransferError && (err.code === "exists" || err.status === 409)) {
+          setTransferStates((prev) => ({
+            ...prev,
+            [name]: {
+              state: "conflict",
+              message: "Already on the relay — Replace deletes it first, then uploads.",
+            },
+          }));
+          await refreshInventory();
+          return;
+        }
+        setTransferStates((prev) => ({
+          ...prev,
+          [name]: { state: "error", message: err instanceof Error ? err.message : String(err) },
+        }));
+      }
+    },
+    [relayBase, tokenTrimmed, refreshInventory]
+  );
+
+  const handleReplaceRelay = useCallback(
+    async (name: string) => {
+      const file = fileBlobs.current.get(name);
+      if (!file) {
+        setTransferStates((prev) => ({
+          ...prev,
+          [name]: {
+            state: "error",
+            message: "File bytes are gone (reloaded) — reimport to replace.",
+          },
+        }));
+        return;
+      }
+      if (!tokenTrimmed) {
+        setTransferStates((prev) => ({
+          ...prev,
+          [name]: { state: "error", message: "Paste the relay publish token first." },
+        }));
+        return;
+      }
+      setTransferStates((prev) => ({ ...prev, [name]: { state: "uploading", message: "Replacing…" } }));
+      try {
+        await deleteRelayMedia(relayBase, tokenTrimmed, name).catch((err) => {
+          if (err instanceof MediaTransferError && err.status === 404) return;
+          throw err;
+        });
+        await uploadMedia(relayBase, tokenTrimmed, file, file);
+        setTransferStates((prev) => ({ ...prev, [name]: { state: "on-relay" } }));
+        await refreshInventory();
+      } catch (err) {
+        setTransferStates((prev) => ({
+          ...prev,
+          [name]: { state: "error", message: err instanceof Error ? err.message : String(err) },
+        }));
+      }
+    },
+    [relayBase, tokenTrimmed, refreshInventory]
+  );
+
+  const handleDeleteRelay = useCallback(
+    async (name: string) => {
+      if (!tokenTrimmed) {
+        setRelayNote("Paste the relay publish token first.");
+        return;
+      }
+      try {
+        await deleteRelayMedia(relayBase, tokenTrimmed, name);
+        setTransferStates((prev) => {
+          const next = { ...prev };
+          delete next[name];
+          return next;
+        });
+        await refreshInventory();
+      } catch (err) {
+        setRelayNote(err instanceof Error ? err.message : String(err));
+      }
+    },
+    [relayBase, tokenTrimmed, refreshInventory]
+  );
+
   const handleImportFiles = useCallback(
     async (files: FileList) => {
       setMediaError(null);
       let firstError: string | null = null;
+      const imported: File[] = [];
       for (const file of Array.from(files)) {
         const validation = validateMediaFile({
           name: file.name,
@@ -408,24 +585,66 @@ export function ReactionEditor(props: ReactionEditorProps) {
           durationMs: null,
           available: true,
         });
+        // Retain bytes for the relay upload (streamed, never re-buffered).
+        fileBlobs.current.set(file.name, file);
+        imported.push(file);
         onMediaChange();
         setSelectedMediaName(file.name);
         void probeMediaMetadata(url, kind).then((meta) => {
-          const current = media.get(file.name);
-          if (current && current.url === url) {
-            media.add({ ...current, ...meta });
-            onMediaChange();
-          }
+          if (applyProbeResult(media, file.name, url, meta)) onMediaChange();
         });
       }
       if (firstError) setMediaError(firstError);
+      // Automatic transfer: when the relay token is present, stream each
+      // import straight to the relay so no manual copy is ever needed.
+      // Without a token the files stay local and the panel offers retry.
+      if (tokenTrimmed) {
+        for (const file of imported) {
+          setTransferStates((prev) =>
+            prev[file.name]?.state === "on-relay" ? prev : { ...prev, [file.name]: { state: "uploading" } }
+          );
+        }
+        for (const file of imported) {
+          try {
+            await uploadMedia(relayBase, tokenTrimmed, file, file);
+            setTransferStates((prev) => ({ ...prev, [file.name]: { state: "on-relay" } }));
+          } catch (err) {
+            if (err instanceof MediaTransferError && (err.code === "exists" || err.status === 409)) {
+              setTransferStates((prev) => ({
+                ...prev,
+                [file.name]: {
+                  state: "conflict",
+                  message: "Already on the relay — Replace deletes it first, then uploads.",
+                },
+              }));
+              continue;
+            }
+            setTransferStates((prev) => ({
+              ...prev,
+              [file.name]: {
+                state: "error",
+                message: err instanceof Error ? err.message : String(err),
+              },
+            }));
+          }
+        }
+        await refreshInventory();
+      }
     },
-    [media, onMediaChange]
+    [media, onMediaChange, relayBase, tokenTrimmed, refreshInventory]
   );
 
   const handleRemoveMedia = useCallback(
     (name: string) => {
       media.remove(name);
+      fileBlobs.current.delete(name);
+      setTransferStates((prev) => {
+        const next = { ...prev };
+        // Local removal drops the local status; relay copies are removed
+        // explicitly via Delete-from-relay so reload persistence is clear.
+        delete next[name];
+        return next;
+      });
       if (selectedMediaName === name) setSelectedMediaName(null);
       onMediaChange();
     },
@@ -457,10 +676,13 @@ export function ReactionEditor(props: ReactionEditorProps) {
           : ((effect as { mediaFile?: string }).mediaFile ?? null);
       const record = mediaFile ? media.get(mediaFile) : undefined;
       if (mediaFile && (!record || !record.available)) {
+        const onRelay = relayInventory?.some((m) => m.name === mediaFile) ?? false;
         setPreviewInput(null);
         setPreviewProgress(0);
         setPreviewStatus(
-          `“${mediaFile}” is not imported in this session — reimport it to preview.`
+          onRelay
+            ? `“${mediaFile}” is on the relay — Fire to OBS still plays it. Reimport to preview locally.`
+            : `“${mediaFile}” is not imported in this session — reimport it to preview.`
         );
         return;
       }
@@ -486,7 +708,7 @@ export function ReactionEditor(props: ReactionEditorProps) {
         setPreviewStatus("Idle — transparent, like OBS.");
       }, visibleMs);
     },
-    [media, stopPreviewTimers]
+    [media, stopPreviewTimers, relayInventory]
   );
 
   const sequence = useSequencePlayback(draft?.sequence ?? NO_STEPS, draft?.effects ?? NO_EFFECTS, {
@@ -587,6 +809,14 @@ export function ReactionEditor(props: ReactionEditorProps) {
               onImportFiles={(files) => void handleImportFiles(files)}
               onRemove={handleRemoveMedia}
               importError={mediaError}
+              relayInventory={relayInventory}
+              transferStates={transferStates}
+              relayNote={relayNote}
+              canUpload={tokenTrimmed.length > 0}
+              onUpload={(name) => void handleUpload(name)}
+              onReplaceRelay={(name) => void handleReplaceRelay(name)}
+              onDeleteRelay={(name) => void handleDeleteRelay(name)}
+              onRefreshRelay={() => void refreshInventory()}
             />
             <section className="editor-panel" aria-label="Pack effects">
               <h2>Effects ({draft.effects.length})</h2>

@@ -7,8 +7,11 @@ webcam: everything previews locally and fires to OBS through the relay.
 ## Workflow
 
 1. **Create a pack** (toolbar): name it, or duplicate/import an existing one.
-2. **Import media** (left): PNG/JPEG/WebP/GIF, MP4/WebM, MP3/WAV/OGG, ≤50 MB,
-   plain filenames. Files stay in memory for this session — nothing uploads.
+2. **Import media** (left): PNG/JPEG/WebP/GIF, MP4/WebM, MP3/WAV/OGG, 50 MB max,
+   plain filenames. With the relay publish token set, imports stream straight
+   to the relay automatically (authenticated, content-validated, atomic); without
+   a token they stay local until you press Send to relay. Duplicates are refused
+   with a confirmed Replace path; relay copies persist on disk across reloads.
 3. **Create an effect** (left): pick a kind (video/image/audio/cutaway/popup/
    frame). Audio/video need the selected media file.
 4. **Configure** (right): name, moment, media, position, duration, trim,
@@ -28,8 +31,9 @@ webcam: everything previews locally and fires to OBS through the relay.
 
 ## Trigger resolution order
 
-- Moment from camera/manual: pack assignments matching (source, moment) win;
-  otherwise the built-in template pick (unchanged V1 behavior).
+- Moment from camera/manual: pack assignments matching (source, moment) win,
+  then source wildcards (assignments with no moment), otherwise the built-in
+  template pick (unchanged V1 behavior).
 - Effect triggers (editor Fire, sequence-free): resolve pack-first, static
   registry second; unknown ids are rejected, never published blindly.
 - Only `frame` effects composite a local PNG. Media effects skip local
@@ -50,8 +54,9 @@ webcam: everything previews locally and fires to OBS through the relay.
 | Data | Location | Notes |
 |---|---|---|
 | Pack JSON (effects, assignments, sequence) | `localStorage` (`live-edits.packs.v1`, active id separately) | Validated with versioned Zod schemas; corrupt data starts clean without destroying the raw value |
-| Media binaries + object URLs | In-memory `MediaRegistry` only | Never written to storage (5 MB quota safety); after reload, entries show “reimport needed” until the file is picked again |
-| Export files | User-chosen download location | Validated on import; effect-id collisions rewritten |
+| Media preview blobs + object URLs | In-memory `MediaRegistry` only | Never written to storage (5 MB quota safety); after reload, previews show reimport guidance but relay copies still fire |
+| Relay media files | Relay media directory on disk (user-writable, loopback uploads only) | Authenticated streaming uploads, 50 MB cap, content sniffing, atomic rename, 409 on duplicates, inventory + delete APIs; survives reloads so saved effects play with no reimport |
+| Export files | User-chosen download location | Validated on import; effect-id collisions rewritten, duplicate pack ids refreshed |
 
 ### Application-data directory investigation
 
@@ -71,12 +76,14 @@ durable path; the editor says so wherever it matters.
 
 ## Media rules (mirrored by the relay)
 
-- Filename allowlist `^[A-Za-z0-9][A-Za-z0-9._-]*$`, ≤128 chars, allowlisted
+- Filename allowlist `^[A-Za-z0-9][A-Za-z0-9._-]*$`, 128 chars max, allowlisted
   extensions; traversal rejected in UI and at the relay boundary.
 - 50 MB cap matches `MAX_FILE_BYTES`; oversize imports fail with the reason.
+- Imports stream to the relay when the publish token is set (no manual copy);
+  duplicates get 409 with a confirmed Replace (delete-then-upload) path.
 - The relay re-validates everything and 400s unknown files — publishing a
-  pack whose media was never copied to the relay media directory fails
-  loudly; **Check relay media** flags it beforehand.
+  pack whose media was never sent to the relay fails
+  loudly; relay inventory flags it beforehand.
 
 ## Keyboard & layout
 
