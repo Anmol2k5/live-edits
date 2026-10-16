@@ -1,0 +1,5 @@
+Local reaction media lives here (gitignored except this marker).
+Drop MP4/WebM/MP3/WAV/OGG/PNG/JPEG/WebP/GIF files in this folder,
+then reference the plain filename in the desktop OBS Bridge panel.
+Files are served only over loopback after token validation; names must
+match ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ and stay under 128 characters.

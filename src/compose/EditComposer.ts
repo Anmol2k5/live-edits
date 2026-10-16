@@ -17,9 +17,26 @@ function loadImage(src: string): Promise<HTMLImageElement> {
 }
 
 /**
+ * True when a video element holds a decodable frame that `captureFrame`
+ * can safely screenshot. Camera-dependent PNG composition must stay
+ * disabled until this returns true — manual OBS triggers without a
+ * webcam take the relay-only path instead.
+ */
+export function hasValidFrame(video: HTMLVideoElement | null | undefined): boolean {
+  if (!video) return false;
+  if (video.readyState < 2) return false;
+  if (video.srcObject === null) return false;
+  return video.videoWidth > 0 && video.videoHeight > 0;
+}
+
+/**
  * Grab a screenshot from a video element as a canvas.
+ * @throws when the video has no decoded frame yet (zero dimensions).
  */
 export function captureFrame(video: HTMLVideoElement): HTMLCanvasElement {
+  if (!video.videoWidth || !video.videoHeight) {
+    throw new Error("Video is not ready — no frame to capture yet.");
+  }
   const canvas = document.createElement("canvas");
   canvas.width = video.videoWidth;
   canvas.height = video.videoHeight;
@@ -46,6 +63,19 @@ export async function compose(
   if (!ctx) throw new Error("Could not get 2D context for compositing");
 
   const slot = template.photoSlot;
+  if (
+    !Number.isFinite(slot.x) ||
+    !Number.isFinite(slot.y) ||
+    !Number.isFinite(slot.width) ||
+    !Number.isFinite(slot.height) ||
+    slot.width <= 0 ||
+    slot.height <= 0
+  ) {
+    throw new Error(`Invalid photo slot in template "${template.id}".`);
+  }
+  if (!screenshot.width || !screenshot.height) {
+    throw new Error("Screenshot has zero dimensions.");
+  }
 
   // Draw screenshot into slot using cover-fit
   ctx.save();

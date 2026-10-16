@@ -32,6 +32,9 @@ export interface ViewfinderHandle {
 export const Viewfinder = forwardRef<ViewfinderHandle, ViewfinderProps>(
   function Viewfinder({ cameraState, onRetry }, ref) {
     const videoRef = useRef<HTMLVideoElement>(null);
+    // Track which stream is currently attached so unrelated re-renders
+    // (e.g. debug-bar ticks) don't reset srcObject every frame.
+    const attachedStreamRef = useRef<MediaStream | null>(null);
 
     useImperativeHandle(ref, () => ({
       getVideo: () => videoRef.current,
@@ -39,13 +42,32 @@ export const Viewfinder = forwardRef<ViewfinderHandle, ViewfinderProps>(
 
     useEffect(() => {
       const video = videoRef.current;
-      if (video && cameraState.status === "active") {
-        video.srcObject = cameraState.stream;
+      if (!video) return;
+      if (cameraState.status !== "active") {
+        if (video.srcObject !== null) video.srcObject = null;
+        attachedStreamRef.current = null;
+        return;
+      }
+      if (attachedStreamRef.current === cameraState.stream) return;
+      attachedStreamRef.current = cameraState.stream;
+      video.srcObject = cameraState.stream;
+      const play = video.play();
+      if (play && typeof play.catch === "function") {
+        play.catch(() => {
+          // Autoplay with muted+playsInline should succeed; a rejection
+          // (e.g. not-yet-visible) leaves the element to start on its own.
+        });
       }
       return () => {
-        if (video) video.srcObject = null;
+        // Only detach if this effect attached the current stream.
+        if (attachedStreamRef.current === cameraState.stream) {
+          if (video.srcObject !== null) video.srcObject = null;
+          attachedStreamRef.current = null;
+        }
       };
-    }, [cameraState]);
+      // Depend on the stream identity, not the whole cameraState object.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [cameraState.status === "active" ? cameraState.stream : null]);
 
     if (cameraState.status === "loading") {
       return (

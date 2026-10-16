@@ -5,25 +5,49 @@ export type CameraResult =
   | { ok: false; error: CameraErrorKind; message: string };
 
 function classifyError(err: unknown): { error: CameraErrorKind; message: string } {
-  if (err instanceof DOMException) {
-    switch (err.name) {
-      case "NotAllowedError":
-        return { error: "denied", message: "Camera permission was denied." };
-      case "NotFoundError":
-        return { error: "not-found", message: "No camera found on this device." };
-      case "NotReadableError":
-      case "AbortError":
-        return { error: "in-use", message: "Camera is in use by another application." };
-      default:
-        return { error: "unknown", message: err.message };
-    }
+  // Most browsers reject with a DOMException, but some (notably older
+  // Chrome for OverconstrainedError) use their own error shapes — read
+  // `name`/`message` structurally instead of relying on instanceof.
+  const name =
+    typeof err === "object" && err !== null && "name" in err
+      ? String((err as { name: unknown }).name)
+      : err instanceof DOMException
+        ? err.name
+        : "";
+  const message =
+    err instanceof Error ? err.message : typeof err === "string" ? err : String(err);
+  switch (name) {
+    case "NotAllowedError":
+    case "SecurityError":
+      return { error: "denied", message: "Camera permission was denied." };
+    case "NotFoundError":
+    case "DevicesNotFoundError":
+      return { error: "not-found", message: "No camera found on this device." };
+    case "NotReadableError":
+    case "TrackStartError":
+    case "AbortError":
+      return { error: "in-use", message: "Camera is in use by another application." };
+    case "OverconstrainedError":
+    case "ConstraintNotSatisfiedError":
+      return { error: "not-found", message: `Requested camera is unavailable (${message}).` };
+    default:
+      return { error: "unknown", message };
   }
-  return { error: "unknown", message: String(err) };
 }
 
 export async function requestCamera(
   deviceId?: string
 ): Promise<CameraResult> {
+  if (
+    typeof navigator === "undefined" ||
+    !navigator.mediaDevices?.getUserMedia
+  ) {
+    return {
+      ok: false,
+      error: "unknown",
+      message: "Camera is not supported in this browser or context (secure context required).",
+    };
+  }
   try {
     const constraints: MediaStreamConstraints = {
       video: deviceId

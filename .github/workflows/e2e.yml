@@ -1,0 +1,28 @@
+name: e2e
+
+on:
+  push:
+    branches: [main, feature/obs-reaction-mvp]
+  pull_request:
+
+jobs:
+  browser-playback:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # Supported CI runners have network and disk for a real browser;
+      # local machines with a full disk can use system Chrome instead
+      # (see docs/OBS_SETUP.md and playwright.config.ts).
+      - run: npx playwright install --with-deps chromium
+      - run: npx playwright test --project=playback
+      - run: npx playwright test --project=autoplay-default
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-output
+          path: tests/e2e/output/
