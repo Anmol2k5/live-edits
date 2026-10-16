@@ -3,6 +3,7 @@ import { publishOverlayTrigger, type PublishableTrigger } from "./relay/overlayC
 import { useCamera } from "./hooks/useCamera";
 import { useMomentDetector } from "./hooks/useMomentDetector";
 import { useEditPipeline, type AnyTrigger } from "./hooks/useEditPipeline";
+import { hasValidFrame } from "./compose/EditComposer";
 import { Viewfinder, type ViewfinderHandle } from "./components/Viewfinder";
 import { MomentDebugBar } from "./components/MomentDebugBar";
 import { EditOverlay } from "./components/EditOverlay";
@@ -39,16 +40,24 @@ export default function App() {
   const { currentEdit, composeError, fireTrigger, dismiss, save } = useEditPipeline();
   const [relayToken, setRelayToken] = useState("");
   const [mediaFile, setMediaFile] = useState("");
+  const [volume, setVolume] = useState("1");
+  const [durationMs, setDurationMs] = useState("");
   const [relayStatus, setRelayStatus] = useState("Not connected");
 
   const publishToOverlay = useCallback((event: PublishableTrigger) => {
     if (!relayToken.trim()) return;
-    void publishOverlayTrigger(event, relayToken.trim(), mediaFile)
+    const parsedVolume = Number(volume);
+    const parsedDuration = Number(durationMs);
+    void publishOverlayTrigger(event, relayToken.trim(), {
+      mediaFile,
+      ...(Number.isFinite(parsedVolume) ? { volume: Math.min(1, Math.max(0, parsedVolume)) } : {}),
+      ...(Number.isInteger(parsedDuration) && parsedDuration > 0 ? { durationMs: parsedDuration } : {}),
+    })
       .then((clients) => setRelayStatus(
         clients ? "Reaction sent to " + clients + " OBS overlay(s)" : "Event accepted; no OBS overlay connected"
       ))
       .catch((error: unknown) => setRelayStatus("Relay unavailable: " + String(error)));
-  }, [relayToken, mediaFile]);
+  }, [relayToken, mediaFile, volume, durationMs]);
 
   // Wire detector events to the shared pipeline. The event stays pending
   // until a video frame is available, so a trigger is never silently lost
@@ -71,12 +80,20 @@ export default function App() {
 
   const handleManualTrigger = useCallback(
     (event: AnyTrigger) => {
+      // Camera-dependent PNG preview only when a real frame exists; the OBS
+      // relay publish below works without any webcam.
       const video = videoRef.current;
-      if (video) fireTrigger(video, event);
+      if (hasValidFrame(video)) {
+        fireTrigger(video as HTMLVideoElement, event);
+      }
       publishToOverlay(event);
     },
     [fireTrigger, publishToOverlay]
   );
+
+  // Manual OBS triggers stay available without a webcam once a relay token
+  // is configured; the local PNG preview still needs the camera.
+  const consoleDisabled = !isActive && !relayToken.trim();
 
   return (
     <div className="app">
@@ -129,7 +146,7 @@ export default function App() {
 
       <TriggerConsole
         onTrigger={handleManualTrigger}
-        disabled={!isActive}
+        disabled={consoleDisabled}
       />
       <details className="relay-settings">
         <summary>OBS Bridge · {relayStatus}</summary>
@@ -141,6 +158,14 @@ export default function App() {
           <label>Optional local video/audio filename (public/reactions/)
             <input value={mediaFile} onChange={(e) => setMediaFile(e.target.value)}
               placeholder="example.webm (blank uses PNG meme frame)" />
+          </label>
+          <label>Volume (0–1)
+            <input value={volume} onChange={(e) => setVolume(e.target.value)}
+              placeholder="1" inputMode="decimal" />
+          </label>
+          <label>Duration override in ms (blank uses effect default)
+            <input value={durationMs} onChange={(e) => setDurationMs(e.target.value)}
+              placeholder="2700" inputMode="numeric" />
           </label>
           <small>Run npm run relay, then paste its private OBS URL into an OBS Browser Source. Webcam frames are never sent to the relay.</small>
         </div>

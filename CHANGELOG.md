@@ -1,5 +1,42 @@
 # Changelog
 
+## M3 — Real-time video/audio reaction engine (2026-10-16, branch feature/obs-reaction-mvp)
+
+Scope: master-prompt Milestone 3 only, OBS integration as target. No SaaS auth/billing/Twitch/dashboard work.
+
+### Integration blockers fixed
+
+- **Tauri CSP**: `connect-src` now adds only `http://127.0.0.1:4190` and `http://localhost:4190` for the loopback relay; every other M1 restriction is byte-identical (`src-tauri/tauri.conf.json`).
+- **Manual triggers without webcam**: the OBS publish path no longer touches any video element. `TriggerConsole` stays enabled with a relay token and no camera; local PNG composition is skipped via the new `hasValidFrame()` guard instead of throwing (`src/App.tsx`, `src/compose/EditComposer.ts`).
+- **Contract preservation**: `publishOverlayTrigger` forwards `triggerId`/`dedupKey`/`expiresAt`/`sequenceNumber`/`effectId` plus `queue`/`priority` resolved from the effect registry; legacy triggers keep working (`src/relay/overlayClient.ts`).
+- **Receiving-boundary enforcement**: the relay rejects expired triggers (400), dedupes `triggerId`/`dedupKey` with a 500-entry bound (202 duplicate, no broadcast), validates `queue`/`priority`/`volume`/`clipStartMs`/`clipEndMs`/`position`, and still accepts legacy `{moment,templateId}` payloads (`scripts/overlay-relay.mjs`).
+
+### Media engine
+
+- `src/effects/effectSchemas.ts`: new discriminated `image`/`video`/`audio`/`cutaway`/`popup` kinds (duration 250–30000ms, trim points with end>start, volume 0–1, position, entrance/exit, priority, queue). `frame` shape and `templateToEffect` are untouched — V1 PNG behavior is unchanged.
+- `src/effects/scheduler.ts` (new): DOM-free `EffectScheduler` — bounded waiting queue (default 6), priority-ordered insert, queue/replace/interrupt/ignore/coexist decisions, expiry, dedup, per-effect cooldowns, `finish()` promotion, `clear()`.
+- `public/obs-overlay.html`: policy-aware player (preempt on replace/interrupt, drop on ignore, priority queue, layered coexist up to 3), trim/volume/position handling, `hello`-event boot-id resync, SSE `id:` fields, media-error skip (never hangs), pause + `src` removal + element teardown per effect, empty transparent stage when idle.
+
+### Relay hardening
+
+- HTTP Range seeks (206 with `Content-Range`, `Accept-Ranges: bytes`, 416 on unsatisfiable) for `/media/` and `/templates/`.
+- Per-boot `bootId` in health, `hello` and reaction events; overlay drops stale waiters on boot change.
+- 20-client SSE cap (503), dead-client eviction on write failure, 4KB body limit retained.
+- `GET /api/media` token-gated inventory (view or publish token) with basename + directory-containment checks; traversal still 404/400.
+- `public/reactions/.gitkeep` documents the local media drop folder.
+
+### Tests (all run, see report)
+
+- Vitest: 16 files / 89 tests — new `mediaEffects` (6), `scheduler` (7), `overlayClient` (5), `overlayDom` browser-engine (7), `hasValidFrame` (2); all M0–M2 suites still green.
+- `test:relay` (node:test): 3 passed — original bridge test untouched plus contract-field validation (expiry/dedup/queue/volume/trim/effect resolution) and Range/media-list/50-trigger ordering.
+- Browser engine: jsdom (installed dependency, real DOM + CSS), with stubbed `EventSource` and media `play()` — video/audio element lifecycles, policies, expiry/dedup, reconnect, transparency and cleanup are asserted against the actual served `obs-overlay.html`. Real decode, physical webcam and OBS compositing remain MANUAL TEST PENDING.
+- `npm ci` clean, `typecheck` clean, `build` success, `npm audit` 0 vulnerabilities. Added `@types/node` + `@types/jsdom` dev deps for the DOM harness.
+- Tauri: `cargo`/`rustc` absent (tauri-cli 2.11.4 present) — desktop packaging verification BLOCKED, recorded in GATES.md.
+
+### Acceptance path (automated portion)
+
+Manual button (contract event, no camera) → `publishOverlayTrigger` → relay validate/expire/dedup → SSE to Browser Source → video-with-audio playback → timed auto-cleanup is covered by `overlayClient` + relay + overlay DOM tests. Facial-expression triggers feed the same pipeline when a webcam is present (`App` detector path unchanged). Live OBS on Windows is NOT claimed.
+
 ## Reconcile M1/M2 with feature/obs-reaction-mvp (2026-10-16)
 
 - Integrated local M1 hardening (inference/camera/composer guards, model-load and compose error surfacing, `ErrorBoundary`, Tauri CSP, opener capability removal) and M2 contracts (trigger/effect schemas, registry, contract-emitting console + detector path) with the remote OBS relay (loopback SSE bridge, token auth, transparent overlay, `publishOverlayTrigger`, relay UI).

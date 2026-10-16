@@ -54,3 +54,19 @@ Scope: A working Tauri 2 desktop app that detects facial expressions from a webc
 - [ ] SaaS identity, billing, hosted backend, and tenant isolation — NOT STARTED
 
 CI passing does not close hardware/manual gates.
+
+## Milestone 3 gates — real-time video/audio reaction engine (OBS target)
+
+- [x] Tauri CSP allows only the loopback relay (`http://127.0.0.1:4190`, `http://localhost:4190`) in `connect-src`; all other M1 restrictions unchanged — `src-tauri/tauri.conf.json`
+- [x] Manual OBS triggers work without webcam access (relay publish decoupled from camera frame capture; console enabled with a relay token and no camera) — `src/App.tsx`, `hasValidFrame` guard in `src/compose/EditComposer.ts`
+- [x] Camera PNG capture stays disabled without a valid frame — `hasValidFrame` unit test
+- [x] M2 contract fields (triggerId/dedupKey/expiresAt/effectId/queue/priority) travel desktop → relay; relay validates, expires (400) and deduplicates (202 duplicate, no broadcast) at its boundary — `src/relay/overlayClient.ts`, `scripts/overlay-relay.mjs`, `npm run test:relay`
+- [x] Legacy `{moment,templateId}` triggers and PNG templates still accepted end to end — relay + overlay + pipeline backwards-compat tests
+- [x] Discriminated media effect kinds (frame/image/video/audio/cutaway/popup) with duration, trim, volume, position, entrance/exit, priority and queue policies — `src/effects/effectSchemas.ts`; V1 frame behavior unchanged
+- [x] Reusable bounded playback scheduler core (priority order, queue/replace/interrupt/ignore/coexist, expiry, dedup, cooldown, 1000-submit burst bound) — `src/effects/scheduler.ts`
+- [x] Relay HTTP Range (206/416) for media seeking; bootId + SSE ids for restart/resync; 20-client cap; `/api/media` inventory; traversal containment — relay tests
+- [x] Overlay: policy-aware player, failed-media skip, reconnect resync, resource release, transparent idle — jsdom browser-engine tests (`src/relay/__tests__/overlayDom.test.ts`)
+- [ ] Physical webcam facial-expression → video-meme-with-audio → OBS Browser Source → auto-cleanup demo — MANUAL TEST PENDING (no webcam/OBS on this machine)
+- [ ] OBS video/audio autoplay and transparent compositing on Windows — MANUAL TEST PENDING
+- [ ] Rust/Tauri desktop package build — BLOCKED (no Rust toolchain; `cargo`/`rustc` absent, tauri-cli 2.11.4 present)
+- [ ] 1h+ streaming stability soak — PENDING

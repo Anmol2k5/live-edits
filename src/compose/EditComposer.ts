@@ -17,6 +17,19 @@ function loadImage(src: string): Promise<HTMLImageElement> {
 }
 
 /**
+ * True when a video element holds a decodable frame that `captureFrame`
+ * can safely screenshot. Camera-dependent PNG composition must stay
+ * disabled until this returns true — manual OBS triggers without a
+ * webcam take the relay-only path instead.
+ */
+export function hasValidFrame(video: HTMLVideoElement | null | undefined): boolean {
+  if (!video) return false;
+  if (video.readyState < 2) return false;
+  if (video.srcObject === null) return false;
+  return video.videoWidth > 0 && video.videoHeight > 0;
+}
+
+/**
  * Grab a screenshot from a video element as a canvas.
  * @throws when the video has no decoded frame yet (zero dimensions).
  */
