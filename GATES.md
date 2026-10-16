@@ -4,15 +4,15 @@ OWNS: src/**, public/templates/**, public/models/**
 
 Scope: A working Tauri 2 desktop app that detects facial expressions from a webcam and composites instant meme-frame overlays.
 
-- [ ] G1: TypeScript compiles with zero `any` and strict mode
+- [x] G1: TypeScript compiles with zero `any` and strict mode
   CHECK: npx tsc --noEmit
   EXPECT: no output (clean compilation)
-  EVIDENCE: pending
+  EVIDENCE: 2026-10-15 `npm run typecheck` clean (pre- and post-M1).
 
 - [x] G2: MomentDetector state machine unit tests pass (GitHub Actions run 38750311593)
   CHECK: npx vitest run src/detector/__tests__/MomentDetector.test.ts
   EXPECT: Tests passed
-  EVIDENCE: pending
+  EVIDENCE: 2026-10-15 `npm run test` 30/30 passed incl. MomentDetector suite; M1 adds MomentDetector.regression (4 tests).
 
 - [ ] G3: Camera denied or missing shows clear error state, not crash
   EVIDENCE: pending
@@ -26,7 +26,7 @@ Scope: A working Tauri 2 desktop app that detects facial expressions from a webc
 - [x] G6: A neutral face held for 30 seconds produces zero triggers (simulation only; GitHub Actions run 38750311593)
   CHECK: npx vitest run src/detector/__tests__/MomentDetector.test.ts --reporter=verbose
   EXPECT: neutral face produces no triggers
-  EVIDENCE: pending
+  EVIDENCE: 2026-10-15 suite case "30 seconds of neutral face = zero triggers" passed; M1 adds sustained-high no-fire regression.
 
 - [ ] G7: All 6 templates render correctly with a real screenshot in the photo slot
   EVIDENCE: pending
@@ -34,7 +34,7 @@ Scope: A working Tauri 2 desktop app that detects facial expressions from a webc
 - [x] G8: Cooldown blocks re-triggering for at least 4 seconds (unit test; GitHub Actions run 38750311593)
   CHECK: npx vitest run src/detector/__tests__/MomentDetector.test.ts --reporter=verbose
   EXPECT: blocks triggers during cooldown
-  EVIDENCE: pending
+  EVIDENCE: 2026-10-15 cases "blocks triggers during cooldown" + "can trigger again after cooldown" passed; M1 regression re-covers immediate re-trigger block.
 
 - [ ] G9: Template registry validates at startup — malformed templates fail loudly
   EVIDENCE: pending
@@ -49,7 +49,7 @@ Scope: A working Tauri 2 desktop app that detects facial expressions from a webc
 - [ ] Face-triggered real OBS playback with a physical webcam — MANUAL TEST PENDING
 - [ ] OBS video/audio autoplay and transparent background on Windows — MANUAL TEST PENDING
 - [ ] Rust/Tauri desktop package build on Windows — MANUAL TEST PENDING
-- [ ] Dependency security audit — npm ci reported 2 high vulnerabilities; triage before release
+- [ ] Dependency security audit — `npm audit fix` applied 2026-10-16 (undici 8.10.0 → 8.12.2, source-map-js 1.2.1 → 1.2.2); `npm audit` now reports 0 vulnerabilities. Manual-gate status otherwise unchanged.
 - [ ] Streaming stability with repeated effects (1h+) — PENDING
 - [ ] SaaS identity, billing, hosted backend, and tenant isolation — NOT STARTED
 

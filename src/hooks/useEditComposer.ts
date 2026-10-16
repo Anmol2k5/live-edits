@@ -15,6 +15,8 @@ export interface EditResult {
 export interface EditComposerHookResult {
   currentEdit: EditResult | null;
   isComposing: boolean;
+  composeError: string | null;
+  /** Backwards-compatible alias for `composeError` (OBS branch naming). */
   error: string | null;
   trigger: (video: HTMLVideoElement, moment: MomentType) => void;
   triggerWithTemplate: (video: HTMLVideoElement, template: Template) => void;
@@ -26,7 +28,7 @@ export interface EditComposerHookResult {
 export function useEditComposer(): EditComposerHookResult {
   const [currentEdit, setCurrentEdit] = useState<EditResult | null>(null);
   const [isComposing, setIsComposing] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [composeError, setComposeError] = useState<string | null>(null);
   const requestRef = useRef(0);
   const mountedRef = useRef(true);
   const currentRef = useRef<EditResult | null>(null);
@@ -35,6 +37,7 @@ export function useEditComposer(): EditComposerHookResult {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      // Invalidate in-flight composes and release the object URL.
       requestRef.current++;
       if (currentRef.current) URL.revokeObjectURL(currentRef.current.url);
       currentRef.current = null;
@@ -44,11 +47,22 @@ export function useEditComposer(): EditComposerHookResult {
   const triggerWithTemplate = useCallback((video: HTMLVideoElement, template: Template) => {
     const request = ++requestRef.current;
     setIsComposing(true);
-    setError(null);
+    setComposeError(null);
 
-    void Promise.resolve()
-      .then(() => compose(captureFrame(video), template))
-      .then((blob) => {
+    // Synchronous fast path so capture failures (e.g. video not ready)
+    // surface immediately instead of hanging `isComposing`.
+    let screenshot: HTMLCanvasElement;
+    try {
+      screenshot = captureFrame(video);
+    } catch (cause: unknown) {
+      console.error("Compositing failed:", cause);
+      setComposeError(cause instanceof Error ? cause.message : String(cause));
+      setIsComposing(false);
+      return;
+    }
+
+    compose(screenshot, template).then(
+      (blob) => {
         if (!mountedRef.current || request !== requestRef.current) return;
         const result: EditResult = {
           blob,
@@ -61,15 +75,15 @@ export function useEditComposer(): EditComposerHookResult {
         currentRef.current = result;
         setCurrentEdit(result);
         if (previous) URL.revokeObjectURL(previous.url);
-      })
-      .catch((cause: unknown) => {
-        if (mountedRef.current && request === requestRef.current) {
-          setError(`Could not create edit: ${String(cause)}`);
-        }
-      })
-      .finally(() => {
-        if (mountedRef.current && request === requestRef.current) setIsComposing(false);
-      });
+        setIsComposing(false);
+      },
+      (cause: unknown) => {
+        if (!mountedRef.current || request !== requestRef.current) return;
+        console.error("Compositing failed:", cause);
+        setComposeError(cause instanceof Error ? cause.message : String(cause));
+        setIsComposing(false);
+      }
+    );
   }, []);
 
   const trigger = useCallback((video: HTMLVideoElement, moment: MomentType) => {
@@ -77,6 +91,7 @@ export function useEditComposer(): EditComposerHookResult {
   }, [triggerWithTemplate]);
 
   const dismiss = useCallback(() => {
+    // Invalidate in-flight work so a stale compose cannot reappear.
     requestRef.current++;
     setIsComposing(false);
     const current = currentRef.current;
@@ -95,5 +110,5 @@ export function useEditComposer(): EditComposerHookResult {
     a.remove();
   }, [currentEdit]);
 
-  return { currentEdit, isComposing, error, trigger, triggerWithTemplate, dismiss, save };
+  return { currentEdit, isComposing, composeError, error: composeError, trigger, triggerWithTemplate, dismiss, save };
 }

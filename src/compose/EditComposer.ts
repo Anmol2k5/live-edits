@@ -18,8 +18,12 @@ function loadImage(src: string): Promise<HTMLImageElement> {
 
 /**
  * Grab a screenshot from a video element as a canvas.
+ * @throws when the video has no decoded frame yet (zero dimensions).
  */
 export function captureFrame(video: HTMLVideoElement): HTMLCanvasElement {
+  if (!video.videoWidth || !video.videoHeight) {
+    throw new Error("Video is not ready — no frame to capture yet.");
+  }
   const canvas = document.createElement("canvas");
   canvas.width = video.videoWidth;
   canvas.height = video.videoHeight;
@@ -46,6 +50,19 @@ export async function compose(
   if (!ctx) throw new Error("Could not get 2D context for compositing");
 
   const slot = template.photoSlot;
+  if (
+    !Number.isFinite(slot.x) ||
+    !Number.isFinite(slot.y) ||
+    !Number.isFinite(slot.width) ||
+    !Number.isFinite(slot.height) ||
+    slot.width <= 0 ||
+    slot.height <= 0
+  ) {
+    throw new Error(`Invalid photo slot in template "${template.id}".`);
+  }
+  if (!screenshot.width || !screenshot.height) {
+    throw new Error("Screenshot has zero dimensions.");
+  }
 
   // Draw screenshot into slot using cover-fit
   ctx.save();

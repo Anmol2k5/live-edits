@@ -1,20 +1,23 @@
 import { useRef, useEffect, useCallback, useState } from "react";
-import { publishOverlayTrigger } from "./relay/overlayClient";
+import { publishOverlayTrigger, type PublishableTrigger } from "./relay/overlayClient";
 import { useCamera } from "./hooks/useCamera";
 import { useMomentDetector } from "./hooks/useMomentDetector";
-import { useEditPipeline } from "./hooks/useEditPipeline";
+import { useEditPipeline, type AnyTrigger } from "./hooks/useEditPipeline";
 import { Viewfinder, type ViewfinderHandle } from "./components/Viewfinder";
 import { MomentDebugBar } from "./components/MomentDebugBar";
 import { EditOverlay } from "./components/EditOverlay";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { TriggerConsole } from "./console/TriggerConsole";
-import type { TriggerEvent } from "./trigger/TriggerEvent";
+import { createMomentTrigger } from "./trigger/triggerSchemas";
 
 export default function App() {
   const { state: cameraState, restart } = useCamera();
   const viewfinderRef = useRef<ViewfinderHandle>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
-  // Keep videoRef synced with the viewfinder's video element
+  // Keep videoRef synced with the viewfinder's video element. Runs after
+  // every render on purpose: the <video> element only exists once the
+  // camera is active, so we re-sync until it appears.
   useEffect(() => {
     const handle = viewfinderRef.current;
     if (handle) {
@@ -29,16 +32,16 @@ export default function App() {
     detectorState,
     lastEvent,
     modelsReady,
-    modelError,
+    modelsError,
     clearLastEvent,
   } = useMomentDetector(videoRef, isActive);
 
-  const { currentEdit, fireTrigger, dismiss, save } = useEditPipeline();
+  const { currentEdit, composeError, fireTrigger, dismiss, save } = useEditPipeline();
   const [relayToken, setRelayToken] = useState("");
   const [mediaFile, setMediaFile] = useState("");
   const [relayStatus, setRelayStatus] = useState("Not connected");
 
-  const publishToOverlay = useCallback((event: TriggerEvent) => {
+  const publishToOverlay = useCallback((event: PublishableTrigger) => {
     if (!relayToken.trim()) return;
     void publishOverlayTrigger(event, relayToken.trim(), mediaFile)
       .then((clients) => setRelayStatus(
@@ -47,25 +50,27 @@ export default function App() {
       .catch((error: unknown) => setRelayStatus("Relay unavailable: " + String(error)));
   }, [relayToken, mediaFile]);
 
-  // Wire detector events to the shared pipeline
+  // Wire detector events to the shared pipeline. The event stays pending
+  // until a video frame is available, so a trigger is never silently lost
+  // when the preview mounts a beat later. The validated contract exercises
+  // the same path the overlay relay uses.
   useEffect(() => {
     if (!lastEvent) return;
     const video = videoRef.current;
     if (!video) return;
 
-    const event: TriggerEvent = {
+    const event = createMomentTrigger(lastEvent.moment, {
       source: "ai-detector",
-      moment: lastEvent.moment,
       confidence: lastEvent.confidence,
-      at: lastEvent.at,
-    };
+      timestamp: lastEvent.at,
+    });
     fireTrigger(video, event);
     publishToOverlay(event);
     clearLastEvent();
   }, [lastEvent, fireTrigger, publishToOverlay, clearLastEvent]);
 
   const handleManualTrigger = useCallback(
-    (event: TriggerEvent) => {
+    (event: AnyTrigger) => {
       const video = videoRef.current;
       if (video) fireTrigger(video, event);
       publishToOverlay(event);
@@ -81,8 +86,8 @@ export default function App() {
           Streamer Moment Overlay
         </h1>
         <div className="app__status">
-          {modelError ? (
-            <span className="app__status-badge app__status-badge--loading" title={modelError}>AI Error</span>
+          {modelsError ? (
+            <span className="app__status-badge app__status-badge--loading" title={modelsError} role="alert">AI Error</span>
           ) : modelsReady ? (
             <span className="app__status-badge app__status-badge--ready">AI Ready</span>
           ) : (
@@ -91,23 +96,41 @@ export default function App() {
         </div>
       </header>
 
+      {modelsError && (
+        <div className="viewfinder__error-detail" role="alert">
+          Model load failed: {modelsError} — check /models assets and reload.
+        </div>
+      )}
+      {composeError && (
+        <div className="viewfinder__error-detail" role="alert">
+          Compose failed: {composeError}
+        </div>
+      )}
+
       <main className="app__main">
-        <Viewfinder
-          ref={viewfinderRef}
-          cameraState={cameraState}
-          onRetry={restart}
-        />
+        <ErrorBoundary>
+          <Viewfinder
+            ref={viewfinderRef}
+            cameraState={cameraState}
+            onRetry={restart}
+          />
+        </ErrorBoundary>
 
         {currentEdit && (
-          <EditOverlay
-            edit={currentEdit}
-            onDismiss={dismiss}
-            onSave={save}
-          />
+          <ErrorBoundary>
+            <EditOverlay
+              edit={currentEdit}
+              onDismiss={dismiss}
+              onSave={save}
+            />
+          </ErrorBoundary>
         )}
       </main>
 
-      <TriggerConsole onTrigger={handleManualTrigger} />
+      <TriggerConsole
+        onTrigger={handleManualTrigger}
+        disabled={!isActive}
+      />
       <details className="relay-settings">
         <summary>OBS Bridge · {relayStatus}</summary>
         <div className="relay-settings__fields">
