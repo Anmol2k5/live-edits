@@ -9,7 +9,8 @@ import { MomentDebugBar } from "./components/MomentDebugBar";
 import { EditOverlay } from "./components/EditOverlay";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { TriggerConsole } from "./console/TriggerConsole";
-import { createMomentTrigger } from "./trigger/triggerSchemas";
+import { RelayPanel } from "./relay/RelayPanel";
+import { createMomentTrigger, createTemplateTrigger } from "./trigger/triggerSchemas";
 
 export default function App() {
   const { state: cameraState, restart } = useCamera();
@@ -91,6 +92,14 @@ export default function App() {
     [fireTrigger, publishToOverlay]
   );
 
+  // One-click end-to-end check: a validated contract trigger straight to
+  // the relay. Needs no camera and touches no local preview.
+  const handleTestReaction = useCallback(() => {
+    publishToOverlay(
+      createTemplateTrigger("wow-1", { source: "manual" })
+    );
+  }, [publishToOverlay]);
+
   // Manual OBS triggers stay available without a webcam once a relay token
   // is configured; the local PNG preview still needs the camera.
   const consoleDisabled = !isActive && !relayToken.trim();
@@ -148,28 +157,19 @@ export default function App() {
         onTrigger={handleManualTrigger}
         disabled={consoleDisabled}
       />
-      <details className="relay-settings">
-        <summary>OBS Bridge · {relayStatus}</summary>
-        <div className="relay-settings__fields">
-          <label>Publish token (from npm run relay)
-            <input type="password" value={relayToken} onChange={(e) => setRelayToken(e.target.value)}
-              placeholder="Paste local relay publish token" autoComplete="off" />
-          </label>
-          <label>Optional local video/audio filename (public/reactions/)
-            <input value={mediaFile} onChange={(e) => setMediaFile(e.target.value)}
-              placeholder="example.webm (blank uses PNG meme frame)" />
-          </label>
-          <label>Volume (0–1)
-            <input value={volume} onChange={(e) => setVolume(e.target.value)}
-              placeholder="1" inputMode="decimal" />
-          </label>
-          <label>Duration override in ms (blank uses effect default)
-            <input value={durationMs} onChange={(e) => setDurationMs(e.target.value)}
-              placeholder="2700" inputMode="numeric" />
-          </label>
-          <small>Run npm run relay, then paste its private OBS URL into an OBS Browser Source. Webcam frames are never sent to the relay.</small>
-        </div>
-      </details>
+      <RelayPanel
+        relayToken={relayToken}
+        setRelayToken={setRelayToken}
+        mediaFile={mediaFile}
+        setMediaFile={setMediaFile}
+        volume={volume}
+        setVolume={setVolume}
+        durationMs={durationMs}
+        setDurationMs={setDurationMs}
+        relayStatus={relayStatus}
+        cameraActive={isActive}
+        onTestReaction={handleTestReaction}
+      />
 
       <MomentDebugBar
         scores={scores}

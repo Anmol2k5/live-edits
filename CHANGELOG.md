@@ -1,8 +1,36 @@
 # Changelog
 
-## M3 — Real-time video/audio reaction engine (2026-10-16, branch feature/obs-reaction-mvp)
+## M4/M5 — OBS integration, companion reliability, streaming verification (2026-10-16, branch feature/obs-reaction-mvp)
 
-Scope: master-prompt Milestone 3 only, OBS integration as target. No SaaS auth/billing/Twitch/dashboard work.
+Scope: master-prompt Milestones 4–5 only. No SaaS auth/billing/Twitch work. No merge, no release claim.
+
+### Verified M3 defects fixed
+
+- **Coexist leak (`public/obs-overlay.html`)**: layered plays never removed their `layers` entry on completion or load failure, so the 3-layer cap wedged permanently after 3 plays. All layer exits (success, load failure, playback error, preemption, boot resync) now go through `try/finally` + `cleanupMain`, each deleting its reference. Proven by a 100-sequential-coexist test (10 drained waves of 3 + 70-burst past the cap + follow-up play) asserting `layers() === 0` and an empty stage.
+- **Range buffering (`scripts/overlay-relay.mjs`)**: `serve()` did `readFile` of the whole file per request (up to the 50 MB cap per hit). Now streams with `createReadStream({start,end})` — constant memory regardless of file size — with 200/206/416, mid-file seek, open-ended, suffix, EOF-edge and malformed→200 handling. Fixed two real bugs found while testing: suffix ranges computed a wrong end, and shutdown hung on undrained clients (streaming only finishes when the peer drains, so `close()` now calls `closeAllConnections()` first and destroys streams on connection close). Relay tests drain bodies.
+- **Duplicated scheduling**: one dependency-free implementation, `src/effects/scheduler-core.js`, consumed three ways — the typed TS wrapper (`src/effects/scheduler.ts`, same public API plus `reset()`/`clearWaiting()`), the overlay player over HTTP (`/obs-player.js` route + `script-src 'self'`), and both test harnesses. `shared/scheduler-cases.json` (9 scenarios) runs in vitest (wrapper) and node:test (raw core) with identical expectations. The overlay delegates submit/finish/clear/reset to the core and keeps only DOM work inline.
+
+### Real-browser playback (Playwright + system Chrome 155, NOT jsdom)
+
+- New `tests/e2e/` suite (9 tests, all passing): self-generated fixtures (440 Hz WAV in Node; canvas-recorded WebM via MediaRecorder — no binaries committed, no licensed media), real relay on loopback, real overlay page. Covers video load/play/seek/finish + `src` disposal, audio volume/playback + fallback art, transparent idle (`rgba(0,0,0,0)` + empty stage), priority-ordered consecutive effects, layer cleanup, replace interruption, malformed/expired rejection, relay restart on the same port with reconnect-then-publish, and a 50-mixed-effect soak asserting idle + `<30 MB` heap growth + no malformed events. Chromium was used from the system install (`channel: "chrome"`) because C: has no room for a Playwright download; jsdom tests are retained but no longer described as media-decoding tests.
+- Test-only fixes from real failures: fixture recorder retries until >2 KB (cold-start flakes), soak durations respect the 250 ms relay minimum, restart test waits for overlay reattach before publishing (broadcasts are not persisted — also documented in `docs/OBS_SETUP.md`).
+
+### Desktop workflow
+
+- New `src/relay/RelayPanel.tsx` (wired into `App`, replacing the bare settings block): live health polling, **Copy OBS URL** (`POST /api/overlay-url`, publish-auth, loopback only), **Send test reaction** (validated contract, no camera needed), **Check relay media** (inventory with kind/size + missing-selection flags), **Probe audio** (real `AudioContext` state + OBS-specific checklist), and an explicit webcam-free vs expression-mode indicator. All controls hit real endpoints; nothing is a placeholder.
+- Relay additions: `POST /api/overlay-url`, `GET /obs-player.js` (shared core), `cooldownMs` accepted and forwarded end to end (overlay enforces per-effect cooldowns via the shared core).
+- `docs/OBS_SETUP.md`: Windows 10/11 + OBS 30+ setup, webcam-free and expression modes, custom media, audio checklist, manual verification list, bridge limits. `docs/RELAY_LIFECYCLE.md`: why in-app start/stop needs a Tauri sidecar (no cargo here to verify one — investigation, not implementation), Windows packaging prerequisites, process hygiene.
+
+### Verification (actual runs, this environment)
+
+- `npm ci` clean; `npm run typecheck` clean (now also covers `tests/e2e` and shared fixtures; M4/M5 added `@playwright/test` and `scripts/overlay-relay.d.mts`).
+- `npm run test`: full Vitest suite green (incl. new scheduler-core delegation, conformance, RelayPanel, hasValidFrame).
+- `npm run test:relay`: relay tests + scheduler conformance green.
+- `npm run test:e2e`: 9/9 green on system Chrome 155 headless.
+- `npm run build`: success. `npm audit`: 0 vulnerabilities.
+- Tauri packaging: BLOCKED (no cargo/rustc; tauri-cli 2.11.4 present). OBS Studio launch, physical webcam, and 1h+ soak: NOT TESTED here — steps and sample-media guidance in docs/OBS_SETUP.md.
+
+## M3 — Real-time video/audio reaction engine (2026-10-16, branch feature/obs-reaction-mvp)
 
 ### Integration blockers fixed
 

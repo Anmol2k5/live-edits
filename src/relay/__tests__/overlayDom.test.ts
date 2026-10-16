@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OVERLAY_PATH = resolve(HERE, "../../../public/obs-overlay.html");
+const CORE_PATH = resolve(HERE, "../../effects/scheduler-core.js");
 
 interface MockSource {
   url: string;
@@ -54,10 +55,19 @@ function requireSource(): MockSource {
 }
 
 async function mountOverlay() {
-  const html = await readFile(OVERLAY_PATH, "utf8");
+  const [html, core] = await Promise.all([
+    readFile(OVERLAY_PATH, "utf8"),
+    readFile(CORE_PATH, "utf8"),
+  ]);
+  // Mirror what the relay serves: the shared core as a classic script ahead
+  // of the inline player (no network in this harness).
+  const bundled = html.replace(
+    '<script src="/obs-player.js"></script>',
+    `<script>${core}</script>`
+  );
   MockEventSource.latest = null;
   const played: string[] = [];
-  const dom = new JSDOM(html, {
+  const dom = new JSDOM(bundled, {
     url: "http://127.0.0.1:4190/overlay?token=t",
     runScripts: "dangerously",
     beforeParse(window: DOMWindow) {
@@ -293,4 +303,53 @@ describe("OBS overlay player (M3, jsdom browser engine)", () => {
       dom.window.close();
     }
   });
+
+  it("survives 100 sequential coexist effects without leaking layers", async () => {
+    const { document, source, waitFor, window, dom } = await mountOverlay();
+    try {
+      const live = () =>
+        (window as unknown as { __liveEdits: { layers: () => number } })
+          .__liveEdits;
+      let seq = 0;
+      const coexist = () =>
+        reaction({
+          sequence: (seq += 1),
+          triggerId: `co-${seq}`,
+          queue: "coexist",
+          durationMs: 15,
+        });
+      // 10 waves of 3 concurrent layers, draining between waves.
+      for (let wave = 0; wave < 10; wave += 1) {
+        source.emit("reaction", coexist());
+        source.emit("reaction", coexist());
+        source.emit("reaction", coexist());
+        await waitFor(
+          () =>
+            document.getElementById("stage")?.childElementCount === 0 &&
+            live().layers() === 0,
+          5000,
+          `wave ${wave} drains`
+        );
+      }
+      // Burst far past the layer cap: extras are refused, none leak.
+      for (let i = 0; i < 70; i += 1) source.emit("reaction", coexist());
+      await waitFor(
+        () =>
+          document.getElementById("stage")?.childElementCount === 0 &&
+          live().layers() === 0,
+        8000,
+        "burst drains"
+      );
+      expect(live().layers()).toBe(0);
+      // The cap is not wedged: a follow-up effect still plays.
+      source.emit("reaction", reaction({ sequence: (seq += 1), durationMs: 30 }));
+      await waitFor(
+        () => document.querySelectorAll("#stage .effect").length === 1,
+        3000,
+        "follow-up plays"
+      );
+    } finally {
+      dom.window.close();
+    }
+  }, 30000);
 });

@@ -50,8 +50,21 @@ Scope: A working Tauri 2 desktop app that detects facial expressions from a webc
 - [ ] OBS video/audio autoplay and transparent background on Windows — MANUAL TEST PENDING
 - [ ] Rust/Tauri desktop package build on Windows — MANUAL TEST PENDING
 - [ ] Dependency security audit — `npm audit fix` applied 2026-10-16 (undici 8.10.0 → 8.12.2, source-map-js 1.2.1 → 1.2.2); `npm audit` now reports 0 vulnerabilities. Manual-gate status otherwise unchanged.
-- [ ] Streaming stability with repeated effects (1h+) — PENDING
+- [ ] 1h+ streaming stability soak — PENDING (50-effect automated soak green; longer manual soak pending, see docs/OBS_SETUP.md checklist)
 - [ ] SaaS identity, billing, hosted backend, and tenant isolation — NOT STARTED
+
+## Milestones 4–5 gates — OBS integration, companion reliability, streaming verification
+
+- [x] Coexist layer references released on success, failure, interruption and cancellation; 100 sequential coexist effects leave zero layers — jsdom test + `window.__liveEdits` diagnostics
+- [x] Media Range served by bounded streams (no full-file buffering): 200/206/416, mid-file seek, open suffix, EOF edge, malformed fallback — relay tests
+- [x] Single scheduling implementation (`src/effects/scheduler-core.js`) shared by the TS wrapper, the overlay player (`/obs-player.js`) and both harnesses; identical behavior pinned by `shared/scheduler-cases.json` (vitest + node:test agree)
+- [x] Real-Chromium playback (system Chrome 155 via Playwright, self-generated WAV/WebM fixtures): video load/play/seek/finish + disposal, audio volume/playback + fallback art, transparent idle, priority-ordered consecutive effects, layer cleanup, replace interruption, malformed/expired rejection, restart reconnect, 50-effect soak with bounded heap — `npm run test:e2e` 9/9
+- [x] Desktop setup workflow: relay health polling, one-click OBS-URL copy (`POST /api/overlay-url`), test-reaction button, media inventory + missing-file flags, audio probe + troubleshooting, webcam-free vs expression mode indicator — `src/relay/RelayPanel.tsx` + tests
+- [x] Relay shutdown immune to stalled clients (`closeAllConnections`); slow-client fd release on connection close
+- [ ] Physical OBS Studio launch test on Windows — NOT TESTED (no OBS installed here; steps in docs/OBS_SETUP.md)
+- [ ] Physical webcam expression → OBS reaction — NOT TESTED (no webcam here)
+- [ ] Rust/Tauri desktop packaging — BLOCKED (no cargo/rustc; tauri-cli 2.11.4 present; prerequisites in docs/RELAY_LIFECYCLE.md)
+- [ ] In-app relay start/stop without a terminal — NOT IMPLEMENTED (needs Tauri sidecar + Rust; investigation in docs/RELAY_LIFECYCLE.md; explicit command block in UI instead of fake controls)
 
 CI passing does not close hardware/manual gates.
 

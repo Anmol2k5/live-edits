@@ -83,6 +83,7 @@ function buildPayload(
         payload.moment = template.moment;
         payload.queue = effect.queue;
         payload.priority = effect.priority;
+        payload.cooldownMs = effect.cooldownMs;
         break;
       }
     }
@@ -109,8 +110,10 @@ function attachPolicy(payload: Record<string, unknown>, effectId: string): void 
     const effect = getEffectById(effectId);
     payload.queue = effect.queue;
     payload.priority = effect.priority;
+    payload.cooldownMs = effect.cooldownMs;
   } catch {
     payload.queue = "replace";
     payload.priority = 50;
+    payload.cooldownMs = 0;
   }
 }

@@ -1,13 +1,17 @@
-import { TriggerDeduper } from "../trigger/triggerSchemas";
+import "./scheduler-core.js";
+import type {
+  CoreEffect,
+  CoreQueuePolicy,
+  CoreScheduler,
+  CoreSchedulerOptions,
+} from "./scheduler-core.js";
 import type { AnyEffect, QueuePolicy } from "./effectSchemas";
 
 /**
- * M3 reusable playback scheduler core (DOM-free).
- *
- * Decides what happens when a validated trigger resolves to an effect
- * while something is already playing. The OBS overlay mirrors this policy
- * in its inline player; unit tests exercise this module directly with
- * fake timers so queue/priority/expiry/dedup behaviour is deterministic.
+ * Typed desktop wrapper around the dependency-free shared core
+ * (`./scheduler-core.js`). All decisions live in the core so the OBS
+ * overlay player (loaded over HTTP) and both test harnesses share one
+ * implementation; behaviour is pinned by `shared/scheduler-cases.json`.
  */
 
 export interface SchedulableTrigger {
@@ -38,115 +42,85 @@ export interface SubmitResult {
     | "cooldown"
     | "queue-full"
     | "ignored-while-busy";
+  /** Scheduling key for start/enqueue/replace outcomes. */
+  key?: string;
   /** The item that was playing when a replace/interrupt landed. */
   preempted?: ScheduledItem;
 }
 
-export interface SchedulerOptions {
+export interface SchedulerOptions extends CoreSchedulerOptions {
   /** Max waiting items (playing item excluded). Overlay uses 6. */
   maxQueue?: number;
   /** Bound for the dedup cache. */
   dedupSize?: number;
 }
 
-const DEFAULT_MAX_QUEUE = 6;
+function toCoreEffect(
+  effect: Pick<AnyEffect, "id" | "enabled" | "priority" | "queue" | "cooldownMs">
+): CoreEffect {
+  return {
+    id: effect.id,
+    enabled: effect.enabled,
+    priority: effect.priority,
+    queue: effect.queue as CoreQueuePolicy,
+    cooldownMs: effect.cooldownMs,
+  };
+}
 
-let schedulerCounter = 0;
+function toItem(raw: {
+  key: string;
+  effectId: string;
+  priority: number;
+  queue: CoreQueuePolicy;
+  triggerId: string;
+  enqueuedAt: number;
+}): ScheduledItem {
+  return {
+    key: raw.key,
+    effectId: raw.effectId,
+    priority: raw.priority,
+    queue: raw.queue as QueuePolicy,
+    triggerId: raw.triggerId,
+    enqueuedAt: raw.enqueuedAt,
+  };
+}
 
 export class EffectScheduler {
-  private current: ScheduledItem | null = null;
-  private readonly waiting: ScheduledItem[] = [];
-  private readonly deduper: TriggerDeduper;
-  private readonly lastFiredAt = new Map<string, number>();
-  private readonly maxQueue: number;
+  private readonly core: CoreScheduler;
 
   constructor(options: SchedulerOptions = {}) {
-    this.maxQueue = options.maxQueue ?? DEFAULT_MAX_QUEUE;
-    this.deduper = new TriggerDeduper(options.dedupSize ?? 500);
+    const factory = globalThis.LiveEditsScheduler?.createScheduler;
+    if (!factory) {
+      throw new Error("Shared scheduler core failed to initialise.");
+    }
+    this.core = factory(options);
   }
 
   get playing(): ScheduledItem | null {
-    return this.current;
+    const current = this.core.playing();
+    return current ? toItem(current) : null;
   }
 
   get queued(): readonly ScheduledItem[] {
-    return this.waiting;
+    return this.core.queued().map(toItem);
   }
 
   get queueLength(): number {
-    return this.waiting.length;
+    return this.core.queueLength();
   }
 
   submit(
-    effect: Pick<
-      AnyEffect,
-      "id" | "enabled" | "priority" | "queue" | "cooldownMs"
-    >,
+    effect: Pick<AnyEffect, "id" | "enabled" | "priority" | "queue" | "cooldownMs">,
     trigger: SchedulableTrigger,
     now: number = Date.now()
   ): SubmitResult {
-    if (!effect.enabled) {
-      return { action: "drop", reason: "disabled" };
-    }
-    if (trigger.expiresAt !== undefined && now > trigger.expiresAt) {
-      return { action: "drop", reason: "expired" };
-    }
-    if (!this.deduper.checkAndAdd(trigger)) {
-      return { action: "drop", reason: "duplicate" };
-    }
-    const last = this.lastFiredAt.get(effect.id);
-    if (last !== undefined && now - last < effect.cooldownMs) {
-      return { action: "drop", reason: "cooldown" };
-    }
-
-    const item: ScheduledItem = {
-      key: `${effect.id}#${trigger.id}#${(schedulerCounter += 1)}`,
-      effectId: effect.id,
-      priority: effect.priority,
-      queue: effect.queue,
-      triggerId: trigger.id,
-      enqueuedAt: now,
+    const result = this.core.submit(toCoreEffect(effect), trigger, now);
+    return {
+      action: result.action,
+      reason: result.reason,
+      ...(result.key !== undefined ? { key: result.key } : {}),
+      ...(result.preempted ? { preempted: toItem(result.preempted) } : {}),
     };
-
-    if (this.current === null) {
-      this.current = item;
-      this.lastFiredAt.set(effect.id, now);
-      return { action: "start", reason: "ok" };
-    }
-
-    switch (effect.queue) {
-      case "ignore":
-        return { action: "drop", reason: "ignored-while-busy" };
-      case "replace":
-      case "interrupt": {
-        const preempted = this.current;
-        this.current = item;
-        this.lastFiredAt.set(effect.id, now);
-        return { action: "replace", reason: "ok", preempted };
-      }
-      case "coexist":
-        // Single-slot stage: coexist starts immediately and shares the
-        // slot lifetime; the caller layers it. Track as current so the
-        // next submit still sees a busy stage.
-        this.lastFiredAt.set(effect.id, now);
-        return { action: "start", reason: "ok" };
-      case "queue": {
-        if (this.waiting.length >= this.maxQueue) {
-          return { action: "drop", reason: "queue-full" };
-        }
-        // Priority-ordered insert, stable for equal priority.
-        let index = this.waiting.length;
-        for (let i = 0; i < this.waiting.length; i += 1) {
-          if (this.waiting[i].priority < item.priority) {
-            index = i;
-            break;
-          }
-        }
-        this.waiting.splice(index, 0, item);
-        this.lastFiredAt.set(effect.id, now);
-        return { action: "enqueue", reason: "ok" };
-      }
-    }
   }
 
   /**
@@ -154,17 +128,21 @@ export class EffectScheduler {
    * Returns the item to start next, if any.
    */
   finish(key?: string): ScheduledItem | null {
-    if (key !== undefined && this.current?.key !== key) {
-      const queuedIndex = this.waiting.findIndex((w) => w.key === key);
-      if (queuedIndex >= 0) this.waiting.splice(queuedIndex, 1);
-      return null;
-    }
-    this.current = this.waiting.shift() ?? null;
-    return this.current;
+    const next = this.core.finish(key);
+    return next ? toItem(next) : null;
   }
 
   clear(): void {
-    this.current = null;
-    this.waiting.length = 0;
+    this.core.clear();
+  }
+
+  /** Drop waiting items without touching the playing item (interrupts). */
+  clearWaiting(): void {
+    this.core.clearWaiting();
+  }
+
+  /** Clear playback state, dedup memory and cooldowns (relay restarts). */
+  reset(): void {
+    this.core.reset();
   }
 }

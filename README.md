@@ -25,11 +25,13 @@ This bridge binds only to \`127.0.0.1:4190\`; it is intended to run on the same 
 
 ## Checks
 
-- \`npm run typecheck\` — TypeScript
-- \`npm test\` — existing Vitest tests
-- \`npm run test:relay\` — Node HTTP/SSE/authentication test
-- \`npm run build\` — frontend production build
-- \`npm run tauri build\` — desktop packaging (requires Rust and desktop toolchain)
+- `npm run typecheck` — TypeScript (app + e2e + shared fixtures)
+- `npm run test` — Vitest unit + jsdom browser-engine tests
+- `npm run test:relay` — Node relay tests + shared scheduler conformance
+- `npm run test:e2e` — Playwright real-Chromium overlay tests (needs system Chrome; point TEMP at a writable disk if C: is full)
+- `npm run build` — frontend production build
+- `npm run tauri build` — desktop packaging (requires Rust and desktop toolchain)
+- `npm audit` — dependency audit (currently 0 vulnerabilities)
 
 ## Known limitations
 

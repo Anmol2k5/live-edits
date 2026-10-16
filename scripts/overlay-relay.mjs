@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { readFile, stat, readdir } from "node:fs/promises";
+import { createReadStream } from "node:fs";
 import { resolve, join, extname, basename, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -71,8 +72,10 @@ function parseTrigger(input){
   if(!QUEUES.has(queue))return null;
   let priority=input.priority??50;
   if(!Number.isInteger(priority)||priority<0||priority>100)return null;
+  let cooldownMs=input.cooldownMs??0;
+  if(!Number.isInteger(cooldownMs)||cooldownMs<0||cooldownMs>60000)return null;
   return {moment:input.moment,templateId,mediaFile:input.mediaFile??null,durationMs,volume,
-    clipStartMs:clipStartMs??null,clipEndMs:clipEndMs??null,position,queue,priority,
+    clipStartMs:clipStartMs??null,clipEndMs:clipEndMs??null,position,queue,priority,cooldownMs,
     effectId:input.effectId??null,
     triggerId:input.triggerId??null,dedupKey:input.dedupKey??null,
     expiresAt:input.expiresAt??null,
@@ -83,32 +86,68 @@ function rangeSlice(header,size){
   if(!match)return null;
   let [,start,end]=match;
   if(start===""&&end==="")return null;
-  let from=start===""?size-Number(end):Number(start);
+  if(start===""){
+    // Suffix range: the final N bytes.
+    const tail=Number(end);
+    if(!Number.isInteger(tail)||tail<=0)return null;
+    const from=Math.max(0,size-tail);
+    return {from,to:size-1};
+  }
+  let from=Number(start);
   let to=end===""?size-1:Number(end);
   if(!Number.isInteger(from)||!Number.isInteger(to)||from<0||to<from||from>=size)return {unsatisfiable:true};
   to=Math.min(to,size-1);
   return {from,to};
 }
-async function serve(res,fullPath,mime,rangeHeader){
-  const info=await stat(fullPath).catch(()=>null);
-  if(!info?.isFile()||info.size>MAX_FILE_BYTES)return json(res,404,{error:"not found"});
-  const size=info.size;
-  const range=rangeHeader?rangeSlice(rangeHeader,size):null;
-  if(range?.unsatisfiable){
-    res.writeHead(416,{"Content-Range":"bytes */"+size,"Accept-Ranges":"bytes"});
-    return res.end();
-  }
-  const body=await readFile(fullPath);
-  if(range){
-    const slice=body.subarray(range.from,range.to+1);
-    res.writeHead(206,{"Content-Type":mime,"Content-Length":slice.length,
-      "Content-Range":"bytes "+range.from+"-"+range.to+"/"+size,
-      "Accept-Ranges":"bytes","X-Content-Type-Options":"nosniff","Cache-Control":"private, max-age=60"});
-    return res.end(slice);
-  }
-  res.writeHead(200,{"Content-Type":mime,"Content-Length":body.length,
-    "Accept-Ranges":"bytes","X-Content-Type-Options":"nosniff","Cache-Control":"private, max-age=60"});
-  res.end(body);
+/**
+ * Bounded file serving: streams from disk (never buffers whole files) with
+ * HTTP Range support for media seeking. Releases the fd on completion,
+ * stream errors and client aborts.
+ */
+function serve(req,res,fullPath,mime,rangeHeader){
+  return new Promise((resolve)=>{
+    let settled=false;
+    const done=()=>{if(!settled){settled=true;resolve();}};
+    stat(fullPath).then((info)=>{
+      if(!info?.isFile()||info.size>MAX_FILE_BYTES){
+        if(!res.headersSent)json(res,404,{error:"not found"});
+        return done();
+      }
+      const size=info.size;
+      const base={"Accept-Ranges":"bytes","X-Content-Type-Options":"nosniff","Cache-Control":"private, max-age=60"};
+      let start=0,end=size-1,status=200;
+      if(rangeHeader){
+        const range=rangeSlice(rangeHeader,size);
+        if(range===null){
+          // Malformed Range: ignore the header and serve the full file.
+        }else if(range.unsatisfiable){
+          res.writeHead(416,{"Content-Range":"bytes */"+size,"Accept-Ranges":"bytes"});
+          res.end();
+          return done();
+        }else{
+          start=range.from;end=range.to;status=206;
+        }
+      }
+      const headers={"Content-Type":mime,"Content-Length":end-start+1,...base};
+      if(status===206)headers["Content-Range"]="bytes "+start+"-"+end+"/"+size;
+      const stream=createReadStream(fullPath,{start,end});
+      stream.on("error",()=>{
+        try{stream.destroy();}catch{}
+        if(!res.headersSent)json(res,404,{error:"not found"});
+        else{try{res.end();}catch{}}
+        done();
+      });
+      // If the client goes away mid-stream, release the fd. `done` is
+      // settled-guarded: 'close' also fires after a normal 'finish'.
+      res.on("close",()=>{try{stream.destroy();}catch{} done();});
+      res.on("finish",done);
+      res.writeHead(status,headers);
+      stream.pipe(res);
+    }).catch(()=>{
+      if(!res.headersSent)json(res,404,{error:"not found"});
+      done();
+    });
+  });
 }
 function broadcast(clients,event){
   const frame="id: "+event.sequence+"\nevent: reaction\ndata: "+JSON.stringify(event)+"\n\n";
@@ -179,8 +218,25 @@ export function createOverlayRelay({
         const body=await readFile(join(ROOT,"public","obs-overlay.html"));
         res.writeHead(200,{"Content-Type":"text/html; charset=utf-8","Cache-Control":"no-store",
           "Referrer-Policy":"no-referrer","X-Content-Type-Options":"nosniff",
-          "Content-Security-Policy":"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self'; media-src 'self';"});
+          "Content-Security-Policy":"default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self'; media-src 'self';"});
         return res.end(body);
+      }
+      if(req.method==="GET"&&url.pathname==="/obs-player.js"){
+        // Shared scheduling core (same file the desktop bundle imports).
+        // Same-origin with the overlay page, allowed by its script-src.
+        const body=await readFile(join(ROOT,"src","effects","scheduler-core.js"));
+        res.writeHead(200,{"Content-Type":"application/javascript; charset=utf-8",
+          "Cache-Control":"private, max-age=60","X-Content-Type-Options":"nosniff"});
+        return res.end(body);
+      }
+      if(req.method==="POST"&&url.pathname==="/api/overlay-url"){
+        // Returns the private OBS Browser Source URL to the publish-token
+        // holder (the streamer on loopback) so the desktop UI can offer
+        // one-click copy without ever handling the view token itself.
+        if(!authorized(req.headers.authorization?.replace(/^Bearer /,""),publishToken))return json(res,401,{error:"unauthorized"});
+        const address=server.address();
+        const port=typeof address==="object"&&address?address.port:4190;
+        return json(res,200,{url:"http://127.0.0.1:"+port+"/overlay?token="+viewToken});
       }
       if(req.method==="GET"&&url.pathname==="/events"){
         if(!authorized(url.searchParams.get("token"),viewToken))return json(res,403,{error:"forbidden"});
@@ -225,14 +281,14 @@ export function createOverlayRelay({
           return json(res,404,{error:"not found"});
         const full=insideDir(templatesDirectory,name);
         if(!full)return json(res,404,{error:"not found"});
-        return await serve(res,full,"image/png",req.headers.range);
+        return await serve(req,res,full,"image/png",req.headers.range);
       }
       if(req.method==="GET"&&url.pathname.startsWith("/media/")){
         const name=basename(url.pathname);
         if(url.pathname!=="/media/"+name||!validMedia(name))return json(res,404,{error:"not found"});
         const full=insideDir(mediaDirectory,name);
         if(!full)return json(res,404,{error:"not found"});
-        return await serve(res,full,MIME[extname(name).toLowerCase()],req.headers.range);
+        return await serve(req,res,full,MIME[extname(name).toLowerCase()],req.headers.range);
       }
       return json(res,404,{error:"not found"});
     }catch(error){
@@ -248,6 +304,9 @@ export function createOverlayRelay({
   const close=()=>new Promise((success,failure)=>{
     for(const client of clients)client.end();
     seenDedup.clear();
+    // A stalled or unread client must not wedge shutdown: streaming
+    // responses only finish once the peer drains them.
+    try{server.closeAllConnections?.();}catch{}
     server.close(error=>error?failure(error):success());
   });
   return {server,listen,close,publishToken,viewToken,bootId};
