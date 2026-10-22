@@ -59,7 +59,7 @@ audit events are append-only per workspace.
 - `npm run test:integration` — the same server suite plus the
   restart/persistence flow against **real PostgreSQL + real S3**
   (`server/run-integration.mjs`; local: Postgres :5433, S3 :5001;
-  CI: `postgres:16` + `minio/minio` via `.github/workflows/saas.yml`).
+  CI: `postgres:16` + a pinned MinIO source build via `.github/workflows/saas.yml`).
   Each test gets an isolated database and bucket.
 - `npm run test:e2e` — includes `saas.spec.ts` (real backend, real
   Chromium: register → workspace → pack → upload → configure → overlay →

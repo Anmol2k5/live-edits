@@ -7,6 +7,9 @@ jobs:
   saas-real-services:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      SAAS_TEST_S3_KEY: test
+      SAAS_TEST_S3_SECRET: testtesttest
     services:
       postgres:
         image: postgres:16
@@ -19,20 +22,33 @@ jobs:
           --health-retries 10
         ports:
           - 5432:5432
-      minio:
-        image: minio/minio:latest
-        env:
-          MINIO_ROOT_USER: test
-          MINIO_ROOT_PASSWORD: testtesttest
-        options: >-
-          --health-cmd "curl -f http://localhost:9000/minio/health/live || exit 1"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-        ports:
-          - 9000:9000
     steps:
       - uses: actions/checkout@v4
+      # MinIO community releases are source-only; do not pull minio/minio:latest.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.8"
+          cache: false
+      - name: Build pinned MinIO
+        run: go install github.com/minio/minio@7aac2a2c5b7c882e68c1ce017d8256be2feea27f
+      - name: Start MinIO and wait for readiness
+        env:
+          MINIO_ROOT_USER: ${{ env.SAAS_TEST_S3_KEY }}
+          MINIO_ROOT_PASSWORD: ${{ env.SAAS_TEST_S3_SECRET }}
+        run: |
+          "$(go env GOPATH)/bin/minio" server "$RUNNER_TEMP/minio-data" --address 127.0.0.1:9000 > "$RUNNER_TEMP/minio.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/minio.pid"
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/ready; then
+              exit 0
+            fi
+            if ! kill -0 "$(cat "$RUNNER_TEMP/minio.pid")" 2>/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          cat "$RUNNER_TEMP/minio.log"
+          exit 1
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -43,5 +59,8 @@ jobs:
         env:
           SAAS_TEST_DSN: postgres://postgres:postgres@localhost:5432/postgres
           SAAS_TEST_S3_ENDPOINT: http://localhost:9000
-          SAAS_TEST_S3_KEY: test
-          SAAS_TEST_S3_SECRET: testtesttest
+      - name: MinIO logs and cleanup
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/minio.log" ]; then cat "$RUNNER_TEMP/minio.log"; fi
+          if [ -f "$RUNNER_TEMP/minio.pid" ]; then kill "$(cat "$RUNNER_TEMP/minio.pid")" || true; fi

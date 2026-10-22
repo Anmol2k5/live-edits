@@ -32,6 +32,7 @@ export interface OverlayEvent {
   mediaUrl: string | null;
   durationMs: number;
   volume: number;
+  muted: boolean;
   clipStartMs: number | null;
   clipEndMs: number | null;
   position: string;
@@ -228,12 +229,46 @@ debug.hidden=query.get("debug")!=="1";
 const sched=window.LiveEditsScheduler.createScheduler({maxQueue:6,dedupSize:200});
 const eventsByKey=new Map();
 const layers=new Map();
+const pendingStarts=new WeakMap();
 let playToken=0,lastSequence=0,lastBootId=null,mainKey=null;
 const status=m=>{debug.textContent=m};
 function release(wrapper){
+pendingStarts.get(wrapper)?.();
 try{const media=wrapper.querySelector("video,audio");if(media){try{media.pause()}catch{}media.removeAttribute("src");try{media.load()}catch{}}
 const imgs=wrapper.querySelectorAll("img");imgs.forEach(i=>i.removeAttribute("src"));}catch{}
 wrapper.remove();
+}
+function startMedia(media,event,wrapper){
+return new Promise(resolve=>{
+let settled=false,started=false,loadTimer;
+const finish=result=>{
+if(settled)return;
+settled=true;clearTimeout(loadTimer);
+media.removeEventListener("error",fail);media.removeEventListener("load",start);media.removeEventListener("loadedmetadata",start);
+pendingStarts.delete(wrapper);resolve(result);
+};
+const fail=()=>finish("failed");
+const start=async()=>{
+if(started||settled||!wrapper.isConnected)return;
+started=true;
+try{if(media.tagName==="VIDEO"||media.tagName==="AUDIO"){
+if(event.clipStartMs!=null)media.currentTime=event.clipStartMs/1000;
+await media.play();
+if(!wrapper.isConnected){try{media.pause()}catch{}return;}
+}}catch(err){if(wrapper.isConnected)status("Media playback blocked: "+err.message)}
+finish("ready");
+};
+pendingStarts.set(wrapper,()=>finish("cancelled"));
+media.addEventListener("error",fail,{once:true});
+if(media.tagName==="IMG"){
+if(media.complete)void start();else{media.addEventListener("load",start,{once:true});loadTimer=setTimeout(()=>finish("ready"),4000);}
+}else if(event.clipStartMs!=null&&media.readyState<1){media.addEventListener("loadedmetadata",start,{once:true});}
+else void start();
+});
+}
+function visibleDuration(event){
+const durationMs=event.durationMs||2700;
+return event.clipEndMs!=null?Math.min(durationMs,Math.max(0,event.clipEndMs-(event.clipStartMs??0))):durationMs;
 }
 function cleanupMain(){const main=stage.querySelector(":scope > .effect--main");if(main)release(main);for(const w of layers.keys())release(w);layers.clear();}
 function effectLike(e){return{id:e.effectId||e.templateId||e.moment,enabled:true,priority:typeof e.priority==="number"?e.priority:50,queue:e.queue||"replace",cooldownMs:typeof e.cooldownMs==="number"?e.cooldownMs:0};}
@@ -245,16 +280,14 @@ const wrapper=document.createElement("div");
 wrapper.className=("effect effect--main "+positionClass(event.position)).trim();
 const src=mediaSrc(event);
 let media;
-if(event.mediaFile&&/\\.(webm|mp4)$/i.test(event.mediaFile)){media=document.createElement("video");media.src=src;media.autoplay=true;media.playsInline=true;media.muted=false;if(typeof event.volume==="number")media.volume=Math.min(1,Math.max(0,event.volume));}
-else if(event.mediaFile&&/\\.(mp3|ogg|wav)$/i.test(event.mediaFile)){media=document.createElement("audio");media.src=src;if(typeof event.volume==="number")media.volume=Math.min(1,Math.max(0,event.volume));const fb=document.createElement("img");fb.src="/o/"+overlayId+"/templates/"+event.templateId+".png";fb.alt=event.moment+" reaction";wrapper.append(fb);}
+if(event.mediaFile&&/\\.(webm|mp4)$/i.test(event.mediaFile)){media=document.createElement("video");media.src=src;media.playsInline=true;media.muted=event.muted===true;if(typeof event.volume==="number")media.volume=Math.min(1,Math.max(0,event.volume));}
+else if(event.mediaFile&&/\\.(mp3|ogg|wav)$/i.test(event.mediaFile)){media=document.createElement("audio");media.src=src;media.muted=event.muted===true;if(typeof event.volume==="number")media.volume=Math.min(1,Math.max(0,event.volume));const fb=document.createElement("img");fb.src="/o/"+overlayId+"/templates/"+event.templateId+".png";fb.alt=event.moment+" reaction";wrapper.append(fb);}
 else{media=document.createElement("img");media.src=src||("/o/"+overlayId+"/templates/"+event.templateId+".png");media.alt=event.moment+" reaction";}
 wrapper.append(media);stage.append(wrapper);status("Playing "+event.moment);
-const failed=await new Promise(resolve=>{media.addEventListener("error",()=>resolve(true),{once:true});
-const start=async()=>{try{if(media.tagName==="VIDEO"||media.tagName==="AUDIO")await media.play();}catch(err){status("Media playback blocked: "+err.message)}resolve(false);};
-if(media.tagName==="IMG"){if(media.complete)void start();else{media.addEventListener("load",()=>void start(),{once:true});setTimeout(()=>resolve(false),4000);}}else void start();});
-if(failed){status("Media failed to load; skipped");release(wrapper);return "failed";}
-let visibleMs=event.durationMs||2700;
-await new Promise(r=>setTimeout(r,visibleMs));
+const started=await startMedia(media,event,wrapper);
+if(started!=="ready"){if(started==="failed")status("Media failed to load; skipped");release(wrapper);return started;}
+await new Promise(r=>setTimeout(r,visibleDuration(event)));
+if(event.clipEndMs!=null)try{media.pause?.()}catch{}
 wrapper.classList.add("effect--leaving");
 await new Promise(r=>setTimeout(r,240));
 release(wrapper);return "done";
@@ -265,14 +298,13 @@ wrapper.className=("effect "+positionClass(event.position)).trim();
 layers.set(wrapper,key);
 try{
 const src=mediaSrc(event);let media;
-if(event.mediaFile&&/\\.(webm|mp4)$/i.test(event.mediaFile)){media=document.createElement("video");media.src=src;media.autoplay=true;media.playsInline=true;media.muted=false;}
-else if(event.mediaFile&&/\\.(mp3|ogg|wav)$/i.test(event.mediaFile)){media=document.createElement("audio");media.src=src;}
-else{media=document.createElement("img");media.src=src||"";media.alt=event.moment+" reaction";}
+if(event.mediaFile&&/\\.(webm|mp4)$/i.test(event.mediaFile)){media=document.createElement("video");media.src=src;media.playsInline=true;media.muted=event.muted===true;if(typeof event.volume==="number")media.volume=Math.min(1,Math.max(0,event.volume));}
+else if(event.mediaFile&&/\\.(mp3|ogg|wav)$/i.test(event.mediaFile)){media=document.createElement("audio");media.src=src;media.muted=event.muted===true;if(typeof event.volume==="number")media.volume=Math.min(1,Math.max(0,event.volume));const fb=document.createElement("img");fb.src="/o/"+overlayId+"/templates/"+event.templateId+".png";fb.alt=event.moment+" reaction";wrapper.append(fb);}
+else{media=document.createElement("img");media.src=src||("/o/"+overlayId+"/templates/"+event.templateId+".png");media.alt=event.moment+" reaction";}
 wrapper.append(media);stage.append(wrapper);
-const failed=await new Promise(resolve=>{media.addEventListener("error",()=>resolve(true),{once:true});
-const start=async()=>{try{if(media.tagName==="VIDEO"||media.tagName==="AUDIO")await media.play();}catch{}resolve(false);};
-if(media.tagName==="IMG"){if(media.complete)void start();else{media.addEventListener("load",()=>void start(),{once:true});setTimeout(()=>resolve(false),4000);}}else void start();});
-if(!failed){await new Promise(r=>setTimeout(r,event.durationMs||2700));wrapper.classList.add("effect--leaving");await new Promise(r=>setTimeout(r,240));}
+const started=await startMedia(media,event,wrapper);
+if(started==="failed")status("Media failed to load; skipped");
+else if(started==="ready"){await new Promise(r=>setTimeout(r,visibleDuration(event)));if(event.clipEndMs!=null)try{media.pause?.()}catch{}wrapper.classList.add("effect--leaving");await new Promise(r=>setTimeout(r,240));}
 }finally{release(wrapper);layers.delete(wrapper);eventsByKey.delete(key);}
 }
 async function runMain(key,token){

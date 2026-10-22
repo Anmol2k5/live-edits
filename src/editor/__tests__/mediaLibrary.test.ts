@@ -130,6 +130,26 @@ describe("media import validation (M6)", () => {
     ).toBe(false);
   });
 
+  it("retains file bytes through metadata updates and releases them on removal or replacement", () => {
+    const registry = new MediaRegistry();
+    const file = new File(["bytes"], "a.png", { type: "image/png" });
+    registry.add(record("a.png"), file);
+    applyProbeResult(registry, "a.png", "blob:a.png", {
+      width: 320,
+      height: 200,
+      durationMs: null,
+    });
+    expect(registry.getFile("a.png")).toBe(file);
+    registry.add({ ...record("a.png"), url: "blob:replacement" });
+    expect(registry.getFile("a.png")).toBeUndefined();
+    registry.add(record("a.png"), file);
+    registry.remove("a.png");
+    expect(registry.getFile("a.png")).toBeUndefined();
+    registry.add(record("a.png"), file);
+    registry.clear();
+    expect(registry.getFile("a.png")).toBeUndefined();
+  });
+
   afterEach(() => {
     vi.unstubAllGlobals();
   });

@@ -1,6 +1,6 @@
 import { createReadStream, createWriteStream } from "node:fs";
 import { mkdir, open, readdir, rename, stat, unlink } from "node:fs/promises";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { basename, extname, join, resolve, sep } from "node:path";
 import { PassThrough } from "node:stream";
 import {
@@ -428,23 +428,23 @@ export class S3Storage implements MediaStorage {
     const flight = `${workspaceId}:${name}`;
     if (this.inFlight.has(flight)) throw new StorageError("That file is already uploading.", "upload in progress");
     if (currentUsageBytes >= quotaBytes) throw new StorageError("Workspace storage quota exceeded.", "quota exceeded");
-    try {
-      await this.client.send(new HeadObjectCommand({ Bucket: this.bucket, Key: objectKey }));
-      throw new StorageError("A file with that name already exists.", "exists");
-    } catch (err) {
-      if (err instanceof StorageError) throw err;
-      // Missing object: proceed with the upload.
-    }
     this.inFlight.add(flight);
     const tmp = this.stagePath();
     try {
+      try {
+        await this.client.send(new HeadObjectCommand({ Bucket: this.bucket, Key: objectKey }));
+        throw new StorageError("A file with that name already exists.", "exists");
+      } catch (err) {
+        if (err instanceof StorageError) throw err;
+        if ((err as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode !== 404) throw err;
+      }
       const { bytes, kind } = await spoolAndValidate(tmp, body, declaredBytes, currentUsageBytes, quotaBytes, name);
       try {
         await this.client.send(
-          new PutObjectCommand({ Bucket: this.bucket, Key: objectKey, Body: createReadStream(tmp) as unknown as Uint8Array, ContentLength: bytes })
+          new PutObjectCommand({ Bucket: this.bucket, Key: objectKey, Body: createReadStream(tmp) as unknown as Uint8Array, ContentLength: bytes, IfNoneMatch: "*" })
         );
       } catch (err) {
-        await this.client.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: objectKey })).catch(() => undefined);
+        if ((err as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode === 412) throw new StorageError("A file with that name already exists.", "exists");
         throw err;
       } finally {
         await unlink(tmp).catch(() => undefined);
@@ -584,7 +584,7 @@ export function verifyMediaUrl(secret: string, workspaceId: string, name: string
   const b = Buffer.from(signature);
   if (a.length !== b.length) return false;
   try {
-    return (Buffer as unknown as { timingSafeEqual: (x: Buffer, y: Buffer) => boolean }).timingSafeEqual(a, b);
+    return timingSafeEqual(a, b);
   } catch {
     return false;
   }

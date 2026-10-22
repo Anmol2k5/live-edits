@@ -68,7 +68,7 @@ npm run test:integration   # full server suite on real PG + real S3, then the re
 default (overridable with `SAAS_TEST_DSN` / `SAAS_TEST_S3_ENDPOINT`).
 Each test gets an isolated database (`saas_t_*`, dropped afterwards) and an
 isolated bucket. CI (`.github/workflows/saas.yml`) runs the same suite
-against `postgres:16` + `minio/minio` services.
+against a `postgres:16` service and a pinned MinIO source build. The workflow starts MinIO explicitly and waits for its readiness endpoint; it does not pull the unavailable `minio/minio:latest` image.
 
 ## Production startup checklist
 

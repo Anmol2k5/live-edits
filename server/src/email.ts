@@ -68,7 +68,7 @@ export class SmtpEmailProvider implements EmailProvider {
 
   private async sendMail(to: string, subject: string, text: string): Promise<void> {
     const { host, port, secure, username, password, from, timeoutMs = 15000 } = this.config;
-    const socket: Socket = await new Promise((resolve, reject) => {
+    let socket: Socket = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("smtp connect timeout")), timeoutMs);
       const connectFn = (secure ? tlsConnect : connect) as (port: number, host: string) => Socket;
       const sock = connectFn(port, host);
@@ -87,7 +87,7 @@ export class SmtpEmailProvider implements EmailProvider {
       const caps = await this.command(socket, `EHLO live-edits\r\n`, timeoutMs, [250]);
       if (!secure && /STARTTLS/i.test(caps)) {
         await this.command(socket, "STARTTLS\r\n", timeoutMs, [220]);
-        await this.upgradeTls(socket, host, timeoutMs);
+        socket = await this.upgradeTls(socket, host, timeoutMs);
         await this.command(socket, `EHLO live-edits\r\n`, timeoutMs, [250]);
       }
       await this.command(socket, "AUTH LOGIN\r\n", timeoutMs, [334]);
@@ -178,18 +178,13 @@ export class SmtpEmailProvider implements EmailProvider {
     return this.readMultiline(socket, timeoutMs, want);
   }
 
-  private async upgradeTls(socket: Socket, host: string, timeoutMs: number): Promise<void> {
-    await new Promise<void>((resolve, reject) => {
+  private upgradeTls(socket: Socket, host: string, timeoutMs: number): Promise<Socket> {
+    return new Promise<Socket>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("smtp tls timeout")), timeoutMs);
       const tls = tlsConnect({ socket, servername: host });
       tls.once("secureConnect", () => {
         clearTimeout(timer);
-        // Rebind the socket's data path to the TLS layer by replacing methods.
-        const target = socket as unknown as Record<string, unknown>;
-        for (const key of ["write", "on", "off", "once", "removeAllListeners", "destroy", "removeListener"] as const) {
-          target[key] = (tls as unknown as Record<string, unknown>)[key];
-        }
-        resolve();
+        resolve(tls);
       });
       tls.once("error", (err) => {
         clearTimeout(timer);

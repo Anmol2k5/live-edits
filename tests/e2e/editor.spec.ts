@@ -20,7 +20,7 @@ test.setTimeout(90000);
 
 test.beforeAll(async () => {
   browser = await chromium.launch({
-    channel: "chrome",
+    executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
     args: [
       "--no-sandbox",
       "--autoplay-policy=no-user-gesture-required",

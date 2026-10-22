@@ -1,8 +1,27 @@
 import { describe, it, expect } from "vitest";
 import { renderHook, act } from "@testing-library/react";
+import { createElement, StrictMode, type PropsWithChildren } from "react";
 import { useUndoable, isDirty } from "../useUndoable";
 
 describe("undo/redo + dirty tracking (M6)", () => {
+  it("keeps history correct when StrictMode replays state updates", () => {
+    const wrapper = ({ children }: PropsWithChildren) =>
+      createElement(StrictMode, null, children);
+    const { result } = renderHook(() => useUndoable(0), { wrapper });
+    act(() => result.current.set(1));
+    act(() => result.current.set(2));
+    act(() => result.current.undo());
+    expect(result.current.state).toBe(1);
+    act(() => result.current.undo());
+    expect(result.current.state).toBe(0);
+    expect(result.current.canUndo).toBe(false);
+    act(() => result.current.redo());
+    expect(result.current.state).toBe(1);
+    act(() => result.current.redo());
+    expect(result.current.state).toBe(2);
+    expect(result.current.canRedo).toBe(false);
+  });
+
   it("pushes, undoes and redoes object states", () => {
     const { result } = renderHook(() => useUndoable({ n: 0 }));
     expect(result.current.canUndo).toBe(false);

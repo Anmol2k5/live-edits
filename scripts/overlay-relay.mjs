@@ -69,7 +69,7 @@ function parseTrigger(input){
     // Effect identity is opaque to the relay (pack effects are not
     // templates): validate shape only. Artwork consistency is still
     // enforced through templateId below.
-    if(!optString(input.effectId,1,128)||!/^effect-[A-Za-z0-9][A-Za-z0-9_-]*$/.test(input.effectId))return null;
+    if(!optString(input.effectId,1,128)||!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(input.effectId))return null;
   }
   if(!TEMPLATES.has(templateId)||!templateId.startsWith(input.moment+"-"))return null;
   if(input.mediaFile!==undefined&&!validMedia(input.mediaFile))return null;
@@ -82,6 +82,8 @@ function parseTrigger(input){
   let volume=input.volume??1;
   if(typeof volume!=="number"||!(volume>=0&&volume<=1))return null;
   volume=Math.min(1,Math.max(0,volume));
+  if(input.muted!==undefined&&typeof input.muted!=="boolean")return null;
+  const muted=input.muted??false;
   let clipStartMs=input.clipStartMs;
   if(clipStartMs!==undefined&&(!Number.isInteger(clipStartMs)||clipStartMs<0||clipStartMs>600000))return null;
   let clipEndMs=input.clipEndMs;
@@ -95,7 +97,7 @@ function parseTrigger(input){
   if(!Number.isInteger(priority)||priority<0||priority>100)return null;
   let cooldownMs=input.cooldownMs??0;
   if(!Number.isInteger(cooldownMs)||cooldownMs<0||cooldownMs>60000)return null;
-  return {moment:input.moment,templateId,mediaFile:input.mediaFile??null,durationMs,volume,
+  return {moment:input.moment,templateId,mediaFile:input.mediaFile??null,durationMs,volume,muted,
     clipStartMs:clipStartMs??null,clipEndMs:clipEndMs??null,position,queue,priority,cooldownMs,
     effectId:input.effectId??null,
     triggerId:input.triggerId??null,dedupKey:input.dedupKey??null,

@@ -74,7 +74,12 @@ describe.runIf(ENABLED)("saas real services: postgres + s3 vertical flow (M7.1)"
     }
     pg = await PostgresStore.connect(`${dsn().replace(/\/[^/]*$/, "")}/${dbName}`);
     storage = new S3Storage(
-      { endpoint: s3Endpoint(), region: "us-east-1", bucket, accessKeyId: "test", secretAccessKey: "test", forcePathStyle: true },
+      {
+        endpoint: s3Endpoint(), region: "us-east-1", bucket,
+        accessKeyId: process.env["SAAS_TEST_S3_KEY"] || "test",
+        secretAccessKey: process.env["SAAS_TEST_S3_SECRET"] || "test",
+        forcePathStyle: true,
+      },
       mkdtempSync(join(tmpdir(), "saas-real-spool-"))
     );
     await storage.init();
@@ -225,7 +230,12 @@ describe.runIf(ENABLED)("saas real services: postgres + s3 vertical flow (M7.1)"
     await app?.close();
     const pg2 = await PostgresStore.connect(`${dsn().replace(/\/[^/]*$/, "")}/${dbName}`);
     const storage2 = new S3Storage(
-      { endpoint: s3Endpoint(), region: "us-east-1", bucket, accessKeyId: "test", secretAccessKey: "test", forcePathStyle: true },
+      {
+        endpoint: s3Endpoint(), region: "us-east-1", bucket,
+        accessKeyId: process.env["SAAS_TEST_S3_KEY"] || "test",
+        secretAccessKey: process.env["SAAS_TEST_S3_SECRET"] || "test",
+        forcePathStyle: true,
+      },
       mkdtempSync(join(tmpdir(), "saas-real-spool2-"))
     );
     const app2 = createSaasApp({ store: pg2, storage: storage2, secret: SECRET, email: new InMemoryEmailProvider() });

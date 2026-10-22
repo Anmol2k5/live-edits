@@ -67,6 +67,11 @@ describe("pack persistence (M6)", () => {
     expect(storage.getItem("live-edits.packs.v1")).toBe("{not json");
   });
 
+  it("opens the app with an empty library when browser storage access is denied", () => {
+    storage.getItem = () => { throw new DOMException("Storage is disabled", "SecurityError"); };
+    expect(loadLibrary(storage)).toEqual({ version: 1, packs: [], activePackId: null });
+  });
+
   it("drops unknown active ids and validates on save", () => {
     const pack = createPack("A");
     saveLibrary({ version: 1, packs: [pack], activePackId: "ghost" }, storage);

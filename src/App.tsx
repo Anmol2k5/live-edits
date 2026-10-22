@@ -66,6 +66,7 @@ export default function App() {
     mediaRef.current = new MediaRegistry();
   }
   const media = mediaRef.current;
+  useEffect(() => () => media.clear(), [media]);
 
   const handleLibraryChange = useCallback((next: PackLibrary) => {
     saveLibrary(next);
@@ -97,10 +98,7 @@ export default function App() {
   // every render on purpose: the <video> element only exists once the
   // camera is active, so we re-sync until it appears.
   useEffect(() => {
-    const handle = viewfinderRef.current;
-    if (handle) {
-      videoRef.current = handle.getVideo();
-    }
+    videoRef.current = viewfinderRef.current?.getVideo() ?? null;
   });
 
   const isActive = cameraState.status === "active";
@@ -112,7 +110,7 @@ export default function App() {
     modelsReady,
     modelsError,
     clearLastEvent,
-  } = useMomentDetector(videoRef, isActive);
+  } = useMomentDetector(videoRef, isActive && view === "live");
 
   const { currentEdit, composeError, fireTrigger, dismiss, save } = useEditPipeline();
   const [relayBase, setRelayBase] = useState(DEFAULT_RELAY_BASE);

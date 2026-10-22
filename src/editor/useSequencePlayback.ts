@@ -25,7 +25,7 @@ export interface SequencePlayback {
 }
 
 export interface SequencePlaybackCallbacks {
-  onCueStart?: (cue: TimedCue) => void;
+  onCueStart?: (cue: TimedCue, offsetMs: number) => void;
   onCueEnd?: (cue: TimedCue) => void;
   onFinish?: () => void;
   onSkipped?: (cue: TimedCue, reason: string) => void;
@@ -55,10 +55,12 @@ export function useSequencePlayback(
     schedulerRef.current = new EffectScheduler({ maxQueue: 6 });
   }
   const [status, setStatus] = useState<PlaybackStatus>("idle");
+  const statusRef = useRef<PlaybackStatus>("idle");
   const [elapsedMs, setElapsedMs] = useState(0);
   const [skippedStepIds, setSkippedStepIds] = useState<string[]>([]);
-  const runRef = useRef({ id: 0, startedAt: 0, base: 0, currentId: null as string | null });
+  const runRef = useRef({ id: 0, startedAt: 0, base: 0, current: null as TimedCue | null });
   const skippedRef = useRef<Set<string>>(new Set());
+  const admittedRef = useRef<Set<string>>(new Set());
   const callbacksRef = useRef(callbacks);
   callbacksRef.current = callbacks;
   const cuesRef = useRef(cues);
@@ -78,17 +80,20 @@ export function useSequencePlayback(
 
   // A new timeline invalidates the run — identified by content signature so
   // re-renders with identical steps never reset a playing sequence.
-  const cueSignature = JSON.stringify(cues.map((c) => [c.stepId, c.startAtMs, c.durationMs]));
+  const cueSignature = JSON.stringify(cues.map((c) => [c.stepId, c.effectId, c.startAtMs, c.durationMs]));
   const lastSignatureRef = useRef<string | null>(null);
   useEffect(() => {
     if (lastSignatureRef.current === cueSignature) return;
     lastSignatureRef.current = cueSignature;
     const run = runRef.current;
+    if (run.current) callbacksRef.current.onCueEnd?.(run.current);
     run.base = 0;
-    run.currentId = null;
+    run.current = null;
     skippedRef.current.clear();
+    admittedRef.current.clear();
     setElapsedMs(0);
     setSkippedStepIds([]);
+    statusRef.current = "idle";
     setStatus("idle");
     clearTimer();
   }, [cueSignature, clearTimer]);
@@ -98,10 +103,10 @@ export function useSequencePlayback(
     const elapsed = run.base + (Date.now() - run.startedAt);
     const timeline = cuesRef.current;
     if (elapsed >= sequenceDuration(timeline)) {
-      const prev = timeline.find((c) => c.stepId === run.currentId);
-      if (prev) callbacksRef.current.onCueEnd?.(prev);
-      run.currentId = null;
+      if (run.current) callbacksRef.current.onCueEnd?.(run.current);
+      run.current = null;
       setElapsedMs(sequenceDuration(timeline));
+      statusRef.current = "idle";
       setStatus("idle");
       clearTimer();
       callbacksRef.current.onFinish?.();
@@ -109,41 +114,46 @@ export function useSequencePlayback(
     }
     setElapsedMs(elapsed);
     const cue = cueAt(timeline, elapsed);
-    if ((cue?.stepId ?? null) === run.currentId) return;
+    if ((cue?.stepId ?? null) === (run.current?.stepId ?? null)) return;
     // A cue the scheduler refused stays refused for this run: re-admitting
     // every tick would spam duplicate/cooldown drops and onSkipped.
     if (cue && skippedRef.current.has(cue.stepId)) return;
-    if (run.currentId !== null) {
-      const prev = timeline.find((c) => c.stepId === run.currentId);
-      if (prev) callbacksRef.current.onCueEnd?.(prev);
-    }
-    run.currentId = cue?.stepId ?? null;
+    if (run.current) callbacksRef.current.onCueEnd?.(run.current);
+    run.current = cue;
     if (!cue) return;
     const effect = effectsRef.current.get(cue.effectId);
     if (!effect) return;
-    const scheduler = schedulerRef.current as EffectScheduler;
-    const result = scheduler.submit(effect, {
-      id: `seq-${run.id}-${cue.stepId}`,
-    });
-    if (result.action === "drop") {
-      skippedRef.current.add(cue.stepId);
-      setSkippedStepIds((prev) => (prev.includes(cue.stepId) ? prev : [...prev, cue.stepId]));
-      callbacksRef.current.onSkipped?.(cue, result.reason);
-      run.currentId = null;
-      return;
+    if (!admittedRef.current.has(cue.stepId)) {
+      const scheduler = schedulerRef.current as EffectScheduler;
+      const result = scheduler.submit(effect, {
+        id: `seq-${run.id}-${cue.stepId}`,
+      });
+      if (result.action === "drop") {
+        skippedRef.current.add(cue.stepId);
+        setSkippedStepIds((prev) => (prev.includes(cue.stepId) ? prev : [...prev, cue.stepId]));
+        callbacksRef.current.onSkipped?.(cue, result.reason);
+        run.current = null;
+        return;
+      }
+      scheduler.finish(result.key);
+      admittedRef.current.add(cue.stepId);
     }
-    scheduler.finish(result.key);
-    callbacksRef.current.onCueStart?.(cue);
+    callbacksRef.current.onCueStart?.(cue, elapsed - cue.startAtMs);
   }, [clearTimer]);
 
   const play = useCallback(() => {
     const run = runRef.current;
-    if (cuesRef.current.length === 0) return;
-    run.id += 1;
+    if (cuesRef.current.length === 0 || statusRef.current === "playing") return;
+    if (statusRef.current === "idle") {
+      run.id += 1;
+      run.base = 0;
+      run.current = null;
+      skippedRef.current.clear();
+      admittedRef.current.clear();
+      setSkippedStepIds([]);
+    }
     run.startedAt = Date.now();
-    run.currentId = null;
-    skippedRef.current.clear();
-    setSkippedStepIds([]);
+    statusRef.current = "playing";
     setStatus("playing");
     clearTimer();
     stopTimer.current = setInterval(tick, tickMs);
@@ -151,9 +161,11 @@ export function useSequencePlayback(
   }, [tick, clearTimer, tickMs]);
 
   const pause = useCallback(() => {
+    if (statusRef.current !== "playing") return;
     const run = runRef.current;
     run.base += Date.now() - run.startedAt;
     setElapsedMs(run.base);
+    statusRef.current = "paused";
     setStatus("paused");
     clearTimer();
   }, [clearTimer]);
@@ -162,33 +174,39 @@ export function useSequencePlayback(
     (ms: number) => {
       const run = runRef.current;
       const clamped = Math.max(0, Math.min(ms, sequenceDuration(cuesRef.current)));
-      if (run.currentId !== null) {
-        const prev = cuesRef.current.find((c) => c.stepId === run.currentId);
-        if (prev) callbacksRef.current.onCueEnd?.(prev);
-        run.currentId = null;
+      if (run.current) {
+        callbacksRef.current.onCueEnd?.(run.current);
+        run.current = null;
+      }
+      if (statusRef.current === "idle") {
+        run.id += 1;
+        admittedRef.current.clear();
+        skippedRef.current.clear();
+        setSkippedStepIds([]);
       }
       run.base = clamped;
       run.startedAt = Date.now();
-      skippedRef.current.clear();
-      setSkippedStepIds([]);
       setElapsedMs(clamped);
+      statusRef.current = "paused";
       setStatus("paused");
       clearTimer();
+      tick();
     },
-    [clearTimer]
+    [clearTimer, tick]
   );
 
   const reset = useCallback(() => {
     const run = runRef.current;
-    if (run.currentId !== null) {
-      const prev = cuesRef.current.find((c) => c.stepId === run.currentId);
-      if (prev) callbacksRef.current.onCueEnd?.(prev);
-      run.currentId = null;
+    if (run.current) {
+      callbacksRef.current.onCueEnd?.(run.current);
+      run.current = null;
     }
     run.base = 0;
     skippedRef.current.clear();
+    admittedRef.current.clear();
     setElapsedMs(0);
     setSkippedStepIds([]);
+    statusRef.current = "idle";
     setStatus("idle");
     clearTimer();
   }, [clearTimer]);

@@ -78,9 +78,30 @@ export function CloudPanel(props: CloudPanelProps): React.JSX.Element {
   const [fireEffectId, setFireEffectId] = useState("");
   const [fireNote, setFireNote] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const sessionGeneration = useRef(0);
+  const loadGeneration = useRef(0);
 
   const authed = token.trim().length > 0;
   const activeWorkspace = workspaces.find((w) => w.id === workspaceId) ?? null;
+
+  const clearSession = useCallback(() => {
+    sessionGeneration.current++;
+    loadGeneration.current++;
+    setToken("");
+    saveSaasToken("");
+    setUserEmail("");
+    setWorkspaces([]);
+    setWorkspaceId("");
+    setPacks([]);
+    setMedia([]);
+    setOverlays([]);
+    setOverlayTokens({});
+    setSessions([]);
+    setFirePackUid("");
+    setFireEffects([]);
+    setFireEffectId("");
+    setCopiedUrl(null);
+  }, []);
 
   useEffect(() => {
     saveSaasBase(base);
@@ -92,73 +113,96 @@ export function CloudPanel(props: CloudPanelProps): React.JSX.Element {
     saveSaasWorkspace(workspaceId);
   }, [workspaceId]);
 
+  // Web sessions survive reload in an HttpOnly cookie, not localStorage.
+  // Invalidate stale restoration when the endpoint changes or the user signs in/out.
+  useEffect(() => {
+    if (getAuthMode() !== "web") return;
+    const generation = ++sessionGeneration.current;
+    let cancelled = false;
+    void saasApi.me(base, "").then(({ user }) => {
+      if (cancelled || generation !== sessionGeneration.current) return;
+      setToken("cookie-session");
+      setUserEmail(user.email);
+    }).catch(() => {
+      // A missing session or offline backend leaves local workflows available.
+    });
+    return () => { cancelled = true; };
+  }, [base]);
+
   const loadAll = useCallback(async () => {
     if (!token.trim()) return;
+    const generation = ++loadGeneration.current;
+    const session = sessionGeneration.current;
+    const stale = () => generation !== loadGeneration.current || session !== sessionGeneration.current;
     try {
-      const [wsList, packList, mediaList, overlayList] = await Promise.all([
-        saasApi.listWorkspaces(base, token),
-        workspaceId ? saasApi.listPacks(base, token, workspaceId) : Promise.resolve({ packs: [] as CloudPackMeta[] }),
-        workspaceId ? saasApi.listMedia(base, token, workspaceId) : Promise.resolve({ media: [] as CloudMediaItem[] }),
-        workspaceId ? saasApi.listOverlays(base, token, workspaceId) : Promise.resolve({ overlays: [] as CloudOverlay[] }),
-      ]);
+      const wsList = await saasApi.listWorkspaces(base, token);
+      if (stale()) return;
       setWorkspaces(wsList.workspaces);
+      if (!workspaceId || !wsList.workspaces.some((w) => w.id === workspaceId)) {
+        setPacks([]);
+        setMedia([]);
+        setOverlays([]);
+        if (workspaceId) setWorkspaceId("");
+        return;
+      }
+      const [packList, mediaList, overlayList] = await Promise.all([
+        saasApi.listPacks(base, token, workspaceId),
+        saasApi.listMedia(base, token, workspaceId),
+        saasApi.listOverlays(base, token, workspaceId),
+      ]);
+      if (stale()) return;
       setPacks(packList.packs);
       setMedia(mediaList.media);
       setOverlays(overlayList.overlays);
-      if (workspaceId && !wsList.workspaces.some((w) => w.id === workspaceId)) {
-        setWorkspaceId("");
-      }
     } catch (err) {
-      setWsNote(messageOf(err));
+      if (!stale()) setWsNote(messageOf(err));
     }
   }, [base, token, workspaceId]);
 
   useEffect(() => {
     if (authed) void loadAll();
+    return () => { loadGeneration.current++; };
   }, [authed, loadAll]);
 
   const handleRegister = useCallback(async () => {
+    const generation = ++sessionGeneration.current;
     setAuthNote(null);
     try {
       const res = await saasApi.register(base, email.trim(), password);
-      setToken(res.token);
+      if (generation !== sessionGeneration.current) return;
+      setToken(getAuthMode() === "desktop" ? res.token : "cookie-session");
       setUserEmail(email.trim());
       setAuthNote("Registered and signed in.");
     } catch (err) {
-      setAuthNote(messageOf(err));
+      if (generation === sessionGeneration.current) setAuthNote(messageOf(err));
     }
   }, [base, email, password]);
 
   const handleLogin = useCallback(async () => {
+    const generation = ++sessionGeneration.current;
     setAuthNote(null);
     try {
       const res = await saasApi.login(base, email.trim(), password);
-      setToken(res.token);
+      if (generation !== sessionGeneration.current) return;
+      setToken(getAuthMode() === "desktop" ? res.token : "cookie-session");
       setUserEmail(email.trim());
       setAuthNote("Signed in.");
     } catch (err) {
-      setAuthNote(messageOf(err));
+      if (generation === sessionGeneration.current) setAuthNote(messageOf(err));
     }
   }, [base, email, password]);
 
   const handleLogout = useCallback(async () => {
+    const generation = ++sessionGeneration.current;
     try {
       await saasApi.logout(base, token);
     } catch {
       // Session may already be gone; still clear locally.
     }
-    setToken("");
-    saveSaasToken("");
-    setUserEmail("");
-    setWorkspaces([]);
-    setWorkspaceId("");
-    setPacks([]);
-    setMedia([]);
-    setOverlays([]);
-    setOverlayTokens({});
-    setSessions([]);
+    if (generation !== sessionGeneration.current) return;
+    clearSession();
     setAuthNote("Signed out.");
-  }, [base, token]);
+  }, [base, token, clearSession]);
 
   const handleRecoverRequest = useCallback(async () => {
     setRecoverNote(null);
@@ -402,7 +446,11 @@ export function CloudPanel(props: CloudPanelProps): React.JSX.Element {
         <h2>Hosted backend</h2>
         <label>
           Backend base URL
-          <input aria-label="Cloud backend URL" value={base} onChange={(e) => setBase(e.target.value)} placeholder="http://127.0.0.1:4290" inputMode="url" />
+          <input aria-label="Cloud backend URL" value={base} onChange={(e) => {
+            clearSession();
+            setAuthNote(null);
+            setBase(e.target.value);
+          }} placeholder="http://127.0.0.1:4290" inputMode="url" />
         </label>
         <p className="editor-hint">Local mode (Live/Editor + loopback relay) keeps working with no backend. Cloud features need the backend from `npm run saas`.</p>
       </section>

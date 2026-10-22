@@ -31,6 +31,7 @@ import {
 import { mediaKindForFile } from "../effects/effectSchemas";
 import { useUndoable, isDirty } from "./useUndoable";
 import { useSequencePlayback } from "./useSequencePlayback";
+import type { TimedCue } from "./sequencePlayer";
 import type { AnyEffect, EffectKind } from "../effects/effectSchemas";
 import type { MomentType } from "../templates/schemas";
 import type { TriggerSource } from "../trigger/triggerSchemas";
@@ -110,7 +111,6 @@ export function ReactionEditor(props: ReactionEditorProps) {
   const [relayInventory, setRelayInventory] = useState<RelayMediaItem[] | null>(null);
   const [relayNote, setRelayNote] = useState<string | null>(null);
   const [transferStates, setTransferStates] = useState<Record<string, TransferStatus>>({});
-  const fileBlobs = useRef(new Map<string, File>());
   const tokenTrimmed = publishToken.trim();
 
   const refreshInventory = useCallback(async () => {
@@ -148,6 +148,7 @@ export function ReactionEditor(props: ReactionEditorProps) {
 
   // Single-effect preview shares the PreviewStage with sequence playback.
   const [previewInput, setPreviewInput] = useState<PlaybackInput | null>(null);
+  const [previewOffsetMs, setPreviewOffsetMs] = useState(0);
   const [previewProgress, setPreviewProgress] = useState(0);
   const [previewStatus, setPreviewStatus] = useState("Idle — transparent, like OBS.");
   const previewTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -447,7 +448,7 @@ export function ReactionEditor(props: ReactionEditorProps) {
   // --- media import + relay transfer -----------------------------------
   const handleUpload = useCallback(
     async (name: string) => {
-      const file = fileBlobs.current.get(name);
+      const file = media.getFile(name);
       if (!file) {
         setTransferStates((prev) => ({
           ...prev,
@@ -488,12 +489,12 @@ export function ReactionEditor(props: ReactionEditorProps) {
         }));
       }
     },
-    [relayBase, tokenTrimmed, refreshInventory]
+    [media, relayBase, tokenTrimmed, refreshInventory]
   );
 
   const handleReplaceRelay = useCallback(
     async (name: string) => {
-      const file = fileBlobs.current.get(name);
+      const file = media.getFile(name);
       if (!file) {
         setTransferStates((prev) => ({
           ...prev,
@@ -527,7 +528,7 @@ export function ReactionEditor(props: ReactionEditorProps) {
         }));
       }
     },
-    [relayBase, tokenTrimmed, refreshInventory]
+    [media, relayBase, tokenTrimmed, refreshInventory]
   );
 
   const handleDeleteRelay = useCallback(
@@ -584,9 +585,7 @@ export function ReactionEditor(props: ReactionEditorProps) {
           height: null,
           durationMs: null,
           available: true,
-        });
-        // Retain bytes for the relay upload (streamed, never re-buffered).
-        fileBlobs.current.set(file.name, file);
+        }, file);
         imported.push(file);
         onMediaChange();
         setSelectedMediaName(file.name);
@@ -637,7 +636,6 @@ export function ReactionEditor(props: ReactionEditorProps) {
   const handleRemoveMedia = useCallback(
     (name: string) => {
       media.remove(name);
-      fileBlobs.current.delete(name);
       setTransferStates((prev) => {
         const next = { ...prev };
         // Local removal drops the local status; relay copies are removed
@@ -668,7 +666,7 @@ export function ReactionEditor(props: ReactionEditorProps) {
 
   // --- preview + sequence playback ------------------------------------
   const showPreview = useCallback(
-    (effect: AnyEffect, durationOverrideMs?: number) => {
+    (effect: AnyEffect, sequenceCue?: TimedCue, offsetMs = 0) => {
       stopPreviewTimers();
       const mediaFile =
         effect.kind === "frame"
@@ -692,9 +690,12 @@ export function ReactionEditor(props: ReactionEditorProps) {
         templateUrl: templateUrlFor(effect),
       };
       setPreviewInput(input);
+      setPreviewOffsetMs(offsetMs);
       setPreviewProgress(0);
-      const visibleMs = durationOverrideMs ?? effect.durationMs;
+      const visibleMs = sequenceCue?.durationMs ?? effect.durationMs;
       setPreviewStatus(`Previewing “${effect.name}” (${(visibleMs / 1000).toFixed(1)}s).`);
+      // Sequence playback owns its window, including pauses and seeks.
+      if (sequenceCue) return;
       const startedAt = Date.now();
       progressTimer.current = setInterval(() => {
         setPreviewProgress(
@@ -712,9 +713,9 @@ export function ReactionEditor(props: ReactionEditorProps) {
   );
 
   const sequence = useSequencePlayback(draft?.sequence ?? NO_STEPS, draft?.effects ?? NO_EFFECTS, {
-    onCueStart: (cue) => {
+    onCueStart: (cue, offsetMs) => {
       const effect = effectsById.get(cue.effectId);
-      if (effect) showPreview(effect);
+      if (effect) showPreview(effect, cue, offsetMs);
     },
     onCueEnd: () => {
       // The next cue (or finish) replaces the stage; gaps restore idle.
@@ -734,8 +735,9 @@ export function ReactionEditor(props: ReactionEditorProps) {
   });
 
   const handlePreviewEffect = useCallback(() => {
+    sequence.reset();
     if (selectedEffect) showPreview(selectedEffect);
-  }, [selectedEffect, showPreview]);
+  }, [selectedEffect, showPreview, sequence.reset]);
 
   const handleFireEffect = useCallback(() => {
     if (draft && selectedEffect) onFireEffect(selectedEffect, draft);
@@ -776,13 +778,15 @@ export function ReactionEditor(props: ReactionEditorProps) {
       {pendingSwitchId && (
         <div className="editor-switch-banner" role="alert">
           <span>Unsaved changes in “{selectedPack?.name}”. Save first?</span>
-          <button type="button" onClick={handleSave}>
+          <button type="button" onClick={() => {
+            handleSave();
+            switchPack(pendingSwitchId);
+          }}>
             Save & switch
           </button>
           <button
             type="button"
             onClick={() => {
-              handleSave();
               switchPack(pendingSwitchId);
             }}
           >
@@ -889,8 +893,12 @@ export function ReactionEditor(props: ReactionEditorProps) {
           <div className="editor-col editor-col--center">
             <PreviewStage
               input={previewInput}
-              progress={previewProgress}
+              progress={sequence.current
+                ? (sequence.elapsedMs - sequence.current.startAtMs) / sequence.current.durationMs
+                : previewProgress}
               statusText={previewStatus}
+              paused={sequence.status === "paused"}
+              offsetMs={previewOffsetMs}
             />
             <SequencePanel
               steps={draft.sequence}

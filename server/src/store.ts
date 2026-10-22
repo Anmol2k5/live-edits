@@ -122,7 +122,8 @@ export interface Store {
   updateUser(id: string, patch: { displayName?: string; passwordHash?: string }): Promise<UserRow | null>;
   createReset(userId: string, tokenHash: string, expiresAt: number): Promise<ResetRow>;
   findResetByHash(tokenHash: string): Promise<ResetRow | null>;
-  markResetUsed(id: string): Promise<void>;
+  /** Atomically consume a valid token, change its user's password, and revoke sessions. */
+  consumeReset(tokenHash: string, passwordHash: string): Promise<string | null>;
   createSession(userId: string, tokenHash: string, expiresAt: number): Promise<SessionRow>;
   findSessionByHash(tokenHash: string): Promise<SessionRow | null>;
   touchSession(id: string): Promise<void>;
@@ -148,6 +149,7 @@ export interface Store {
   listMedia(workspaceId: string): Promise<MediaRow[]>;
   deleteMedia(workspaceId: string, name: string): Promise<MediaRow | null>;
   workspaceMediaBytes(workspaceId: string): Promise<number>;
+  withMediaLock<T>(workspaceId: string, operation: (media: MediaStore) => Promise<T>): Promise<T>;
   createOverlay(workspaceId: string, name: string, viewTokenHash: string, createdBy: string | null): Promise<OverlayRow>;
   findOverlayById(id: string): Promise<OverlayRow | null>;
   findOverlayByTokenHash(hash: string): Promise<OverlayRow | null>;
@@ -161,6 +163,8 @@ export interface Store {
   listAudit(workspaceId: string, limit: number): Promise<AuditRow[]>;
 }
 
+export type MediaStore = Pick<Store, "createMedia" | "updateMediaVersion" | "findMedia" | "deleteMedia" | "workspaceMediaBytes" | "recordAudit">;
+
 export class MemoryStore implements Store {
   private users = new Map<string, UserRow>();
   private usersByEmail = new Map<string, string>();
@@ -172,6 +176,7 @@ export class MemoryStore implements Store {
   private memberships = new Map<string, MembershipRow>();
   private packs = new Map<string, PackRow>();
   private media = new Map<string, MediaRow>();
+  private mediaLocks = new Map<string, Promise<void>>();
   private overlays = new Map<string, OverlayRow>();
   private overlaysByHash = new Map<string, string>();
   private triggers: TriggerRow[] = [];
@@ -212,9 +217,17 @@ export class MemoryStore implements Store {
     const id = this.resetsByHash.get(tokenHash);
     return (id && this.resets.get(id)) || null;
   }
-  async markResetUsed(id: string): Promise<void> {
-    const row = this.resets.get(id);
-    if (row) row.usedAt = Date.now();
+  async consumeReset(tokenHash: string, passwordHash: string): Promise<string | null> {
+    const resetId = this.resetsByHash.get(tokenHash);
+    const reset = resetId ? this.resets.get(resetId) : null;
+    if (!reset || reset.usedAt !== null || Date.now() >= reset.expiresAt) return null;
+    const user = this.users.get(reset.userId);
+    if (!user) return null;
+    user.passwordHash = passwordHash;
+    user.updatedAt = nowIso();
+    reset.usedAt = Date.now();
+    this.removeUserSessions(user.id);
+    return user.id;
   }
   async createSession(userId: string, tokenHash: string, expiresAt: number): Promise<SessionRow> {
     if (!this.users.has(userId)) throw conflict("no user");
@@ -239,6 +252,9 @@ export class MemoryStore implements Store {
     return this.sessions.delete(id);
   }
   async deleteSessionsForUser(userId: string): Promise<number> {
+    return this.removeUserSessions(userId);
+  }
+  private removeUserSessions(userId: string): number {
     let n = 0;
     for (const [id, row] of [...this.sessions]) {
       if (row.userId === userId) {
@@ -298,6 +314,10 @@ export class MemoryStore implements Store {
     const key = `${workspaceId}:${userId}`;
     const existing = this.memberships.get(key);
     if (existing) {
+      if (existing.role === "owner" && role !== "owner") {
+        const owners = [...this.memberships.values()].filter((m) => m.workspaceId === workspaceId && m.role === "owner");
+        if (owners.length <= 1) throw conflict("last owner");
+      }
       existing.role = role;
       return existing;
     }
@@ -384,6 +404,17 @@ export class MemoryStore implements Store {
     for (const m of this.media.values()) if (m.workspaceId === workspaceId) total += m.bytes;
     return total;
   }
+  async withMediaLock<T>(workspaceId: string, operation: (media: MediaStore) => Promise<T>): Promise<T> {
+    const previous = this.mediaLocks.get(workspaceId) ?? Promise.resolve();
+    const running = previous.then(() => operation(this));
+    const settled = running.then(() => undefined, () => undefined);
+    this.mediaLocks.set(workspaceId, settled);
+    try {
+      return await running;
+    } finally {
+      if (this.mediaLocks.get(workspaceId) === settled) this.mediaLocks.delete(workspaceId);
+    }
+  }
   async createOverlay(workspaceId: string, name: string, viewTokenHash: string, createdBy: string | null): Promise<OverlayRow> {
     if (!this.workspaces.has(workspaceId)) throw conflict("no workspace");
     if (this.overlaysByHash.has(viewTokenHash)) throw conflict("overlay exists");
@@ -458,8 +489,16 @@ export async function readMigrationSql(): Promise<string> {
   return readFile(migrationPath(), "utf8");
 }
 
-type PgPool = {
+type PgQueryable = {
   query: (text: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }>;
+};
+
+type PgClient = PgQueryable & {
+  release: () => void;
+};
+
+type PgPool = PgQueryable & {
+  connect: () => Promise<PgClient>;
   end: () => Promise<void>;
 };
 
@@ -478,8 +517,10 @@ function num(v: unknown): number {
  */
 export class PostgresStore implements Store {
   private pool: PgPool;
-  private constructor(pool: PgPool) {
+  private queryable: PgQueryable;
+  private constructor(pool: PgPool, queryable: PgQueryable = pool) {
     this.pool = pool;
+    this.queryable = queryable;
   }
 
   static async connect(databaseUrl: string): Promise<PostgresStore> {
@@ -506,6 +547,28 @@ export class PostgresStore implements Store {
 
   async close(): Promise<void> {
     await this.pool.end();
+  }
+
+  private async transaction<T>(operation: (client: PgClient) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await operation(client);
+      await client.query("COMMIT");
+      return result;
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  private async withWorkspaceLock<T>(workspaceId: string, operation: (client: PgClient) => Promise<T>): Promise<T> {
+    return this.transaction(async (client) => {
+      await client.query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
+      return operation(client);
+    });
   }
 
   async createUser(email: string, passwordHash: string, displayName: string): Promise<UserRow> {
@@ -577,8 +640,20 @@ export class PostgresStore implements Store {
     const r = rows[0];
     return r ? { id: str(r["id"]), userId: str(r["userId"]), tokenHash: str(r["tokenHash"]), expiresAt: num(r["expiresAt"]), usedAt: r["usedAt"] == null ? null : num(r["usedAt"]), createdAt: num(r["createdAt"]) } : null;
   }
-  async markResetUsed(id: string): Promise<void> {
-    await this.pool.query(`UPDATE password_resets SET used_at = now() WHERE id = $1`, [id]);
+  async consumeReset(tokenHash: string, passwordHash: string): Promise<string | null> {
+    return this.transaction(async (client) => {
+      const { rows } = await client.query(
+        `UPDATE password_resets SET used_at = clock_timestamp()
+         WHERE token_hash = $1 AND used_at IS NULL AND expires_at > clock_timestamp()
+         RETURNING user_id::text AS "userId"`,
+        [tokenHash]
+      );
+      if (!rows[0]) return null;
+      const userId = str(rows[0]["userId"]);
+      await client.query("UPDATE users SET password_hash = $2, updated_at = now() WHERE id = $1", [userId, passwordHash]);
+      await client.query("DELETE FROM sessions WHERE user_id = $1", [userId]);
+      return userId;
+    });
   }
   async createSession(userId: string, tokenHash: string, expiresAt: number): Promise<SessionRow> {
     const { rows } = await this.pool.query(
@@ -677,15 +752,24 @@ export class PostgresStore implements Store {
     return r ? { id: str(r["id"]), name: str(r["name"]), ownerId: str(r["ownerId"]), activePackUid: (r["activePackUid"] as string) ?? null, createdAt: str(r["createdAt"]), updatedAt: str(r["updatedAt"]) } : null;
   }
   async addMember(workspaceId: string, userId: string, role: Role): Promise<MembershipRow> {
-    const { rows } = await this.pool.query(
-      `INSERT INTO memberships (workspace_id, user_id, role) VALUES ($1,$2,$3)
-       ON CONFLICT (workspace_id, user_id) DO UPDATE SET role = EXCLUDED.role
-       RETURNING workspace_id::text AS "workspaceId", user_id::text AS "userId", role,
-                 created_at::text AS "createdAt"`,
-      [workspaceId, userId, role]
-    );
-    const r = rows[0] as Record<string, unknown>;
-    return { workspaceId: str(r["workspaceId"]), userId: str(r["userId"]), role: str(r["role"]) as Role, createdAt: str(r["createdAt"]) };
+    return this.withWorkspaceLock(workspaceId, async (client) => {
+      if (role !== "owner") {
+        const current = await client.query("SELECT role FROM memberships WHERE workspace_id = $1 AND user_id = $2", [workspaceId, userId]);
+        if (current.rows[0]?.["role"] === "owner") {
+          const owners = await client.query("SELECT count(*) AS c FROM memberships WHERE workspace_id = $1 AND role = 'owner'", [workspaceId]);
+          if (num(owners.rows[0]?.["c"]) <= 1) throw conflict("last owner");
+        }
+      }
+      const { rows } = await client.query(
+        `INSERT INTO memberships (workspace_id, user_id, role) VALUES ($1,$2,$3)
+         ON CONFLICT (workspace_id, user_id) DO UPDATE SET role = EXCLUDED.role
+         RETURNING workspace_id::text AS "workspaceId", user_id::text AS "userId", role,
+                   created_at::text AS "createdAt"`,
+        [workspaceId, userId, role]
+      );
+      const r = rows[0] as Record<string, unknown>;
+      return { workspaceId: str(r["workspaceId"]), userId: str(r["userId"]), role: str(r["role"]) as Role, createdAt: str(r["createdAt"]) };
+    });
   }
   async findMembership(workspaceId: string, userId: string): Promise<MembershipRow | null> {
     const { rows } = await this.pool.query(
@@ -705,14 +789,16 @@ export class PostgresStore implements Store {
     return rows.map((r) => ({ workspaceId: str(r["workspaceId"]), userId: str(r["userId"]), role: str(r["role"]) as Role, createdAt: str(r["createdAt"]) }));
   }
   async removeMember(workspaceId: string, userId: string): Promise<boolean> {
-    const mem = await this.findMembership(workspaceId, userId);
-    if (!mem) return false;
-    if (mem.role === "owner") {
-      const { rows } = await this.pool.query(`SELECT count(*) AS c FROM memberships WHERE workspace_id = $1 AND role = 'owner'`, [workspaceId]);
-      if (num((rows[0] as Record<string, unknown>)["c"]) <= 1) throw conflict("last owner");
-    }
-    await this.pool.query(`DELETE FROM memberships WHERE workspace_id = $1 AND user_id = $2`, [workspaceId, userId]);
-    return true;
+    return this.withWorkspaceLock(workspaceId, async (client) => {
+      const mem = await client.query("SELECT role FROM memberships WHERE workspace_id = $1 AND user_id = $2", [workspaceId, userId]);
+      if (!mem.rows[0]) return false;
+      if (mem.rows[0]["role"] === "owner") {
+        const { rows } = await client.query("SELECT count(*) AS c FROM memberships WHERE workspace_id = $1 AND role = 'owner'", [workspaceId]);
+        if (num(rows[0]?.["c"]) <= 1) throw conflict("last owner");
+      }
+      await client.query("DELETE FROM memberships WHERE workspace_id = $1 AND user_id = $2", [workspaceId, userId]);
+      return true;
+    });
   }
   async upsertPack(workspaceId: string, packUid: string, name: string, version: number, data: unknown, createdBy: string | null): Promise<PackRow> {
     const { rows } = await this.pool.query(
@@ -751,7 +837,7 @@ export class PostgresStore implements Store {
   }
   async createMedia(row: Omit<MediaRow, "id" | "createdAt">): Promise<MediaRow> {
     try {
-      const { rows } = await this.pool.query(
+      const { rows } = await this.queryable.query(
         `INSERT INTO media (workspace_id, name, bytes, kind, mime, version, storage_key, uploaded_by)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
          RETURNING id::text AS id, workspace_id::text AS "workspaceId", name, bytes, kind, mime, version,
@@ -765,7 +851,7 @@ export class PostgresStore implements Store {
     }
   }
   async updateMediaVersion(workspaceId: string, name: string, bytes: number, mime: string, storageKey: string): Promise<MediaRow | null> {
-    const { rows } = await this.pool.query(
+    const { rows } = await this.queryable.query(
       `UPDATE media SET bytes = $3, mime = $4, storage_key = $5, version = version + 1 WHERE workspace_id = $1 AND name = $2
        RETURNING id::text AS id, workspace_id::text AS "workspaceId", name, bytes, kind, mime, version,
                  storage_key AS "storageKey", uploaded_by::text AS "uploadedBy", created_at::text AS "createdAt"`,
@@ -775,7 +861,7 @@ export class PostgresStore implements Store {
     return r ? mediaFrom(r) : null;
   }
   async findMedia(workspaceId: string, name: string): Promise<MediaRow | null> {
-    const { rows } = await this.pool.query(
+    const { rows } = await this.queryable.query(
       `SELECT id::text AS id, workspace_id::text AS "workspaceId", name, bytes, kind, mime, version,
               storage_key AS "storageKey", uploaded_by::text AS "uploadedBy", created_at::text AS "createdAt"
        FROM media WHERE workspace_id = $1 AND name = $2 LIMIT 1`,
@@ -794,7 +880,7 @@ export class PostgresStore implements Store {
     return rows.map(mediaFrom);
   }
   async deleteMedia(workspaceId: string, name: string): Promise<MediaRow | null> {
-    const { rows } = await this.pool.query(
+    const { rows } = await this.queryable.query(
       `DELETE FROM media WHERE workspace_id = $1 AND name = $2
        RETURNING id::text AS id, workspace_id::text AS "workspaceId", name, bytes, kind, mime, version,
                  storage_key AS "storageKey", uploaded_by::text AS "uploadedBy", created_at::text AS "createdAt"`,
@@ -804,8 +890,11 @@ export class PostgresStore implements Store {
     return r ? mediaFrom(r) : null;
   }
   async workspaceMediaBytes(workspaceId: string): Promise<number> {
-    const { rows } = await this.pool.query(`SELECT COALESCE(sum(bytes),0) AS total FROM media WHERE workspace_id = $1`, [workspaceId]);
+    const { rows } = await this.queryable.query(`SELECT COALESCE(sum(bytes),0) AS total FROM media WHERE workspace_id = $1`, [workspaceId]);
     return num((rows[0] as Record<string, unknown>)["total"]);
+  }
+  async withMediaLock<T>(workspaceId: string, operation: (media: MediaStore) => Promise<T>): Promise<T> {
+    return this.withWorkspaceLock(workspaceId, (client) => operation(new PostgresStore(this.pool, client)));
   }
   async createOverlay(workspaceId: string, name: string, viewTokenHash: string, createdBy: string | null): Promise<OverlayRow> {
     const { rows } = await this.pool.query(
@@ -908,7 +997,7 @@ export class PostgresStore implements Store {
     return rows.map(triggerFrom);
   }
   async recordAudit(row: Omit<AuditRow, "id" | "createdAt">): Promise<AuditRow> {
-    const { rows } = await this.pool.query(
+    const { rows } = await this.queryable.query(
       `INSERT INTO audit_events (workspace_id, actor_id, action, target, meta) VALUES ($1,$2,$3,$4,$5)
        RETURNING id::text AS id, workspace_id::text AS "workspaceId", actor_id::text AS "actorId",
                  action, target, meta, created_at::text AS "createdAt"`,

@@ -149,19 +149,26 @@ export function probeMediaMetadata(
  */
 export class MediaRegistry {
   private readonly records = new Map<string, MediaRecord>();
+  private readonly files = new Map<string, File>();
 
-  add(record: MediaRecord): void {
+  add(record: MediaRecord, file?: File): void {
     // Reimporting the same filename replaces the entry: release the stale
     // object URL first so repeated imports never leak blobs.
     const previous = this.records.get(record.name);
     if (previous && previous.url !== record.url) {
+      this.files.delete(record.name);
       try {
         URL.revokeObjectURL(previous.url);
       } catch {
         // Revocation is best-effort; the record is still replaced.
       }
     }
+    if (file) this.files.set(record.name, file);
     this.records.set(record.name, record);
+  }
+
+  getFile(name: string): File | undefined {
+    return this.files.get(name);
   }
 
   get(name: string): MediaRecord | undefined {
@@ -186,6 +193,7 @@ export class MediaRegistry {
     } catch {
       // Revocation is best-effort; the record is still dropped.
     }
+    this.files.delete(name);
     return this.records.delete(name);
   }
 

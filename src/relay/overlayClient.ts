@@ -17,6 +17,7 @@ export interface PublishMediaOptions {
   mediaFile?: string;
   durationMs?: number;
   volume?: number;
+  muted?: boolean;
   clipStartMs?: number;
   clipEndMs?: number;
   position?: string;
@@ -29,7 +30,7 @@ export interface PublishMediaOptions {
  * deduplicate at its receiving boundary.
  *
  * M6: with a pack, effect triggers resolve pack-first and media effects
- * publish their full playback config (media file, duration, volume, trim,
+ * publish their full playback config (media file, duration, volume, mute, trim,
  * position, queue, priority, cooldown) — the same fields the editor
  * preview renders. Caller `media` options override the effect defaults.
  */
@@ -116,6 +117,7 @@ function buildPayload(
   if (mediaFile) payload.mediaFile = mediaFile;
   if (opts.durationMs !== undefined) payload.durationMs = opts.durationMs;
   if (opts.volume !== undefined) payload.volume = opts.volume;
+  if (opts.muted !== undefined) payload.muted = opts.muted;
   if (opts.clipStartMs !== undefined) payload.clipStartMs = opts.clipStartMs;
   if (opts.clipEndMs !== undefined) payload.clipEndMs = opts.clipEndMs;
   if (opts.position !== undefined) payload.position = opts.position;
@@ -182,6 +184,7 @@ function applyPackEffect(
   payload.templateId = template?.id ?? `${effect.moment}-1`;
   if (mediaFile) payload.mediaFile = mediaFile;
   if ("volume" in effect) payload.volume = effect.volume;
+  if ("muted" in effect) payload.muted = effect.muted;
   if ("position" in effect) payload.position = effect.position;
   if ("clipStartMs" in effect && effect.clipStartMs !== undefined) {
     payload.clipStartMs = effect.clipStartMs;

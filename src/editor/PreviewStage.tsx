@@ -6,6 +6,9 @@ interface PreviewStageProps {
   /** 0–1 progress through the visible window. */
   progress: number;
   statusText: string;
+  paused?: boolean;
+  /** Initial position within this preview window, after any trim start. */
+  offsetMs?: number;
 }
 
 /**
@@ -14,44 +17,54 @@ interface PreviewStageProps {
  * (single effect preview or the shared-scheduler sequence player) — this
  * component only renders and releases.
  */
-export function PreviewStage({ input, progress, statusText }: PreviewStageProps) {
+export function PreviewStage({ input, progress, statusText, paused = false, offsetMs = 0 }: PreviewStageProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const plan = input ? effectToPlayback(input) : null;
+  const clipStartMs = plan?.clipStartMs ?? 0;
 
   useEffect(() => {
-    const video = videoRef.current;
-    if (video && plan?.clipStartMs !== null && plan?.clipStartMs !== undefined) {
+    const media = videoRef.current ?? audioRef.current;
+    if (media) {
       const apply = (): void => {
         try {
-          if (plan.clipStartMs !== null && video.readyState >= 1) {
-            video.currentTime = (plan.clipStartMs as number) / 1000;
+          if (media.readyState >= 1) {
+            media.currentTime = (clipStartMs + offsetMs) / 1000;
           }
         } catch {
           // Best effort; a missed trim never blocks the preview.
         }
       };
-      if (video.readyState >= 1) apply();
-      else video.addEventListener("loadedmetadata", apply, { once: true });
+      if (media.readyState >= 1) apply();
+      else media.addEventListener("loadedmetadata", apply, { once: true });
+      return () => media.removeEventListener("loadedmetadata", apply);
     }
-  }, [plan?.src, plan?.clipStartMs]);
+  }, [input, clipStartMs, offsetMs]);
 
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    const video = videoRef.current;
+    const audio = audioRef.current;
+    return () => {
       // Release on unmount/replace so repeated previews never pile up.
       try {
-        videoRef.current?.pause();
+        video?.pause();
       } catch {
         // Ignore teardown races.
       }
       try {
-        audioRef.current?.pause();
+        audio?.pause();
       } catch {
         // Ignore teardown races.
       }
-    },
-    [plan?.src]
-  );
+    };
+  }, [plan?.src]);
+
+  useEffect(() => {
+    const media = videoRef.current ?? audioRef.current;
+    if (!media) return;
+    if (paused) media.pause();
+    else void media.play()?.catch(() => undefined);
+  }, [paused, input]);
 
   const percent = Math.max(0, Math.min(1, progress));
 

@@ -17,7 +17,7 @@ test.setTimeout(90000);
 
 test.beforeAll(async () => {
   browser = await chromium.launch({
-    channel: "chrome",
+    executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
     // NOTE: no --autoplay-policy flag here — this project runs the stock
     // browser policy on purpose.
     args: ["--no-sandbox", "--mute-audio", "--disable-dev-shm-usage"],

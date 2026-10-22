@@ -111,7 +111,7 @@ export function useMomentDetector(
       detector.reset();
       setDetectorState({ status: "idle" });
     };
-  }, [active, modelsReady, videoRef]);
+  }, [active, modelsReady, videoRef, configKey]);
 
   return { scores, detectorState, lastEvent, modelsReady, modelsError, clearLastEvent };
 }

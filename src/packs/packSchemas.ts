@@ -127,16 +127,18 @@ export interface ImportCollisionSets {
 export function importPack(data: unknown, existing: ImportCollisionSets): ReactionPack {
   const pack = parsePack(data);
   const effectIds = existing.effectIds ?? new Set<string>();
+  const reserved = new Set([...effectIds, ...pack.effects.map((effect) => effect.id)]);
   const idMap = new Map<string, string>();
   for (const effect of pack.effects) {
     if (effectIds.has(effect.id) || idMap.has(effect.id)) {
       let n = 2;
       let candidate = `${effect.id}-imported-${n}`;
-      while (effectIds.has(candidate) || [...idMap.values()].includes(candidate)) {
+      while (reserved.has(candidate)) {
         n += 1;
         candidate = `${effect.id}-imported-${n}`;
       }
       idMap.set(effect.id, candidate);
+      reserved.add(candidate);
     }
   }
   let id = pack.id;

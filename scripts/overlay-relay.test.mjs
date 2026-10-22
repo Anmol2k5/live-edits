@@ -151,12 +151,67 @@ test("relay validates M3 contract fields: expiry, dedup, queue metadata", async 
     assert.equal(response.status,202,"pack effect ids are opaque to the relay");
 
     response=await fetch(base+"/api/trigger",{method:"POST",headers,
-      body:JSON.stringify({moment:"wow",effectId:"not-an-effect"})});
+      body:JSON.stringify({moment:"wow",effectId:"../not-an-effect"})});
     assert.equal(response.status,400,"malformed effect ids are rejected");
 
     response=await fetch(base+"/api/trigger",{method:"POST",headers,
       body:JSON.stringify({moment:"wow",templateId:"sad-1"})});
     assert.equal(response.status,400,"template artwork must still match the moment");
+  } finally {
+    await relay.close();
+  }
+});
+
+test("relay preserves boolean mute settings and defaults legacy triggers to audible", async () => {
+  const relay=createOverlayRelay({publishToken:"p-token",viewToken:"v-token"});
+  const address=await relay.listen(0);
+  const base="http://127.0.0.1:"+address.port;
+  const headers={Authorization:"Bearer p-token","Content-Type":"application/json"};
+  const controller=new AbortController();
+  try {
+    const stream=await fetch(base+"/events?token=v-token",{signal:controller.signal});
+    const reader=stream.body.getReader();
+    await reader.read();
+    for(const [input,expected] of [[{muted:true},true],[{muted:false},false],[{},false]]){
+      const response=await fetch(base+"/api/trigger",{method:"POST",headers,
+        body:JSON.stringify({moment:"wow",...input})});
+      assert.equal(response.status,202);
+      await response.json();
+      const {value}=await reader.read();
+      const data=new TextDecoder().decode(value).split("\n").find(line=>line.startsWith("data: "));
+      assert.equal(JSON.parse(data.slice(6)).muted,expected);
+    }
+    for(const muted of ["true",1,null]){
+      const response=await fetch(base+"/api/trigger",{method:"POST",headers,
+        body:JSON.stringify({moment:"wow",muted})});
+      assert.equal(response.status,400,"mute must be a boolean");
+      await response.arrayBuffer();
+    }
+    await reader.cancel().catch(()=>{});
+  } finally {
+    controller.abort();
+    await relay.close();
+  }
+});
+
+test("relay accepts bounded custom pack effect ids and rejects malformed identities", async () => {
+  const relay=createOverlayRelay({publishToken:"p-token",viewToken:"v-token"});
+  const address=await relay.listen(0);
+  const base="http://127.0.0.1:"+address.port;
+  const headers={Authorization:"Bearer p-token","Content-Type":"application/json"};
+  try {
+    for(const effectId of ["custom-clip","clip.1","effect-wow-1","x".repeat(128)]){
+      const response=await fetch(base+"/api/trigger",{method:"POST",headers,
+        body:JSON.stringify({moment:"wow",effectId})});
+      assert.equal(response.status,202,`valid pack effect id ${effectId}`);
+      await response.arrayBuffer();
+    }
+    for(const effectId of ["","x".repeat(129),"../clip","clip/1","bad id","_clip"]){
+      const response=await fetch(base+"/api/trigger",{method:"POST",headers,
+        body:JSON.stringify({moment:"wow",effectId})});
+      assert.equal(response.status,400,`invalid pack effect id ${effectId}`);
+      await response.arrayBuffer();
+    }
   } finally {
     await relay.close();
   }

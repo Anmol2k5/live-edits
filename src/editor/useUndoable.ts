@@ -17,61 +17,58 @@ export interface Undoable<T> {
  * (by JSON) are coalesced so typing a name doesn't flood the stack.
  */
 export function useUndoable<T>(initial: T, limit: number = DEFAULT_LIMIT): Undoable<T> {
-  const [past, setPast] = useState<T[]>([]);
-  const [present, setPresent] = useState<T>(initial);
-  const [future, setFuture] = useState<T[]>([]);
+  const [history, setHistory] = useState({
+    past: [] as T[],
+    present: initial,
+    future: [] as T[],
+  });
+  const { past, present, future } = history;
   const limitRef = useRef(limit);
   limitRef.current = limit;
 
   const set = useCallback((next: T | ((prev: T) => T)) => {
-    setPresent((prev) => {
-      const value = typeof next === "function" ? (next as (p: T) => T)(prev) : next;
-      if (JSON.stringify(value) === JSON.stringify(prev)) return prev;
-      setPast((p) => {
-        const grown = [...p, prev];
-        return grown.length > limitRef.current
+    setHistory((prev) => {
+      const value = typeof next === "function" ? (next as (p: T) => T)(prev.present) : next;
+      if (JSON.stringify(value) === JSON.stringify(prev.present)) return prev;
+      const grown = [...prev.past, prev.present];
+      return {
+        past: grown.length > limitRef.current
           ? grown.slice(grown.length - limitRef.current)
-          : grown;
-      });
-      setFuture([]);
-      return value;
+          : grown,
+        present: value,
+        future: [],
+      };
     });
   }, []);
 
   const undo = useCallback(() => {
-    setPast((p) => {
-      if (p.length === 0) return p;
-      const previous = p[p.length - 1] as T;
-      const rest = p.slice(0, -1);
-      setPresent((cur) => {
-        setFuture((f) => [cur, ...f]);
-        return previous;
-      });
-      return rest;
+    setHistory((prev) => {
+      if (prev.past.length === 0) return prev;
+      return {
+        past: prev.past.slice(0, -1),
+        present: prev.past[prev.past.length - 1] as T,
+        future: [prev.present, ...prev.future],
+      };
     });
   }, []);
 
   const redo = useCallback(() => {
-    setFuture((f) => {
-      if (f.length === 0) return f;
-      const [next, ...rest] = f as [T, ...T[]];
-      setPresent((cur) => {
-        setPast((p) => {
-          const grown = [...p, cur];
-          return grown.length > limitRef.current
-            ? grown.slice(grown.length - limitRef.current)
-            : grown;
-        });
-        return next;
-      });
-      return rest;
+    setHistory((prev) => {
+      if (prev.future.length === 0) return prev;
+      const [next, ...rest] = prev.future as [T, ...T[]];
+      const grown = [...prev.past, prev.present];
+      return {
+        past: grown.length > limitRef.current
+          ? grown.slice(grown.length - limitRef.current)
+          : grown,
+        present: next,
+        future: rest,
+      };
     });
   }, []);
 
   const reset = useCallback((next: T) => {
-    setPast([]);
-    setFuture([]);
-    setPresent(next);
+    setHistory({ past: [], present: next, future: [] });
   }, []);
 
   return useMemo(

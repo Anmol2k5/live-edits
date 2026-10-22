@@ -45,6 +45,7 @@ export const TriggerPublishSchema = z.object({
   mediaFile: MediaNameSchema.optional(),
   durationMs: z.number().int().min(250).max(30000).optional(),
   volume: z.number().min(0).max(1).optional(),
+  muted: z.boolean().optional(),
   clipStartMs: z.number().int().min(0).max(600000).optional(),
   clipEndMs: z.number().int().min(1).max(600000).optional(),
   position: z.enum(["center", "fullscreen", "top-left", "top-right", "bottom-left", "bottom-right"]).optional(),

@@ -1,3 +1,5 @@
+import { isTauri } from "@tauri-apps/api/core";
+
 export class SaasError extends Error {
   constructor(message: string, public readonly status: number) {
     super(message);
@@ -17,7 +19,10 @@ const TOKEN_KEY = "live-edits.saas.token";
 const BASE_KEY = "live-edits.saas.base";
 const WORKSPACE_KEY = "live-edits.saas.workspace";
 const MODE_KEY = "live-edits.saas.auth-mode";
-export const DEFAULT_SAAS_BASE = "http://127.0.0.1:4290";
+export const DEFAULT_SAAS_BASE =
+  typeof window !== "undefined" && window.location.hostname === "localhost"
+    ? "http://localhost:4290"
+    : "http://127.0.0.1:4290";
 
 export function getAuthMode(): SaasAuthMode {
   try {
@@ -26,7 +31,7 @@ export function getAuthMode(): SaasAuthMode {
   } catch {
     // ignore storage failures
   }
-  return typeof window !== "undefined" && "__TAURI__" in window ? "desktop" : "web";
+  return isTauri() ? "desktop" : "web";
 }
 
 export function setAuthMode(mode: SaasAuthMode): void {

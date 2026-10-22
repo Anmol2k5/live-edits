@@ -80,16 +80,17 @@ async function testStorage(): Promise<{ storage: MediaStorage; cleanup: () => Pr
   return { storage, cleanup: async () => undefined };
 }
 
-export async function startTestApp(opts: { email?: InMemoryEmailProvider } = {}): Promise<TestApp & { secret: string; email: InMemoryEmailProvider }> {
+export async function startTestApp(opts: { email?: InMemoryEmailProvider; quotaBytes?: number } = {}): Promise<TestApp & { secret: string; email: InMemoryEmailProvider; store: Store }> {
   const { store, cleanup: dropStore } = await testStore();
   const { storage } = await testStorage();
   const email = opts.email ?? new InMemoryEmailProvider();
-  const app = createSaasApp({ store, storage, secret: "test-secret-0123456789abcdef", email });
+  const app = createSaasApp({ store, storage, secret: "test-secret-0123456789abcdef", email, quotaBytes: opts.quotaBytes });
   const { base } = await app.listen(0);
   return {
     base,
     secret: app.secret,
     email,
+    store,
     close: async () => {
       await app.close();
       await dropStore();

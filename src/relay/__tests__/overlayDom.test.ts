@@ -3,6 +3,7 @@ import { JSDOM, type DOMWindow } from "jsdom";
 import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { hostedOverlayHtml } from "../../../server/src/overlays";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OVERLAY_PATH = resolve(HERE, "../../../public/obs-overlay.html");
@@ -54,19 +55,21 @@ function requireSource(): MockSource {
   return current;
 }
 
-async function mountOverlay() {
+async function mountPlayer(playMedia?: (media: HTMLMediaElement) => Promise<void>, hosted = false) {
   const [html, core] = await Promise.all([
-    readFile(OVERLAY_PATH, "utf8"),
+    hosted ? hostedOverlayHtml("test-overlay") : readFile(OVERLAY_PATH, "utf8"),
     readFile(CORE_PATH, "utf8"),
   ]);
   // Mirror what the relay serves: the shared core as a classic script ahead
   // of the inline player (no network in this harness).
   const bundled = html.replace(
-    '<script src="/obs-player.js"></script>',
+    hosted ? '<script src="/o/test-overlay/scheduler-core.js"></script>' : '<script src="/obs-player.js"></script>',
     `<script>${core}</script>`
   );
   MockEventSource.latest = null;
   const played: string[] = [];
+  const playback: Array<{ media: HTMLMediaElement; currentTime: number; muted: boolean }> = [];
+  const paused: HTMLMediaElement[] = [];
   const dom = new JSDOM(bundled, {
     url: "http://127.0.0.1:4190/overlay?token=t",
     runScripts: "dangerously",
@@ -77,7 +80,13 @@ async function mountOverlay() {
         this: HTMLMediaElement
       ): Promise<void> {
         played.push(this.tagName);
+        playback.push({ media: this, currentTime: this.currentTime, muted: this.muted });
+        await playMedia?.(this);
       };
+      window.HTMLMediaElement.prototype.pause = function pause(this: HTMLMediaElement) {
+        paused.push(this);
+      };
+      window.HTMLMediaElement.prototype.load = function load() {};
     },
   });
   const { window } = dom;
@@ -103,7 +112,7 @@ async function mountOverlay() {
     }
   };
   const source = requireSource();
-  return { window, document, source, played, waitFor, fireLoad, dom };
+  return { window, document, source, played, playback, paused, waitFor, fireLoad, dom };
 }
 
 function reaction(overrides: Record<string, unknown> = {}) {
@@ -125,7 +134,9 @@ function reaction(overrides: Record<string, unknown> = {}) {
   };
 }
 
-describe("OBS overlay player (M3, jsdom browser engine)", () => {
+describe.each(["local", "hosted"])("%s OBS overlay player (jsdom browser engine)", (variant) => {
+  const mountOverlay = (playMedia?: (media: HTMLMediaElement) => Promise<void>) =>
+    mountPlayer(playMedia, variant === "hosted");
   it("starts transparent and idle", async () => {
     const { document, window, dom } = await mountOverlay();
     try {
@@ -194,6 +205,162 @@ describe("OBS overlay player (M3, jsdom browser engine)", () => {
         5000,
         "audio cleaned up"
       );
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it.each([
+    ["replace", "clip.webm"], ["coexist", "clip.webm"],
+    ["replace", "sting.mp3"], ["coexist", "sting.mp3"],
+  ])("seeks trimmed %s %s after metadata and before playback", async (queue, mediaFile) => {
+    const { document, source, playback, window, waitFor, dom } = await mountOverlay();
+    try {
+      if (queue === "coexist") {
+        source.emit("reaction", reaction({ sequence: 1, durationMs: 2000 }));
+      }
+      source.emit("reaction", reaction({
+        sequence: 2, mediaFile, durationMs: 2000, queue,
+        clipStartMs: 1200, clipEndMs: 1280,
+      }));
+      const video = document.querySelector("#stage video,#stage audio") as HTMLMediaElement;
+      expect(video).not.toBeNull();
+      expect(playback).toHaveLength(0);
+      Object.defineProperty(video, "readyState", { value: 1 });
+      video.dispatchEvent(new window.Event("loadedmetadata"));
+      await waitFor(() => playback.length === 1);
+      expect(playback[0].currentTime).toBe(1.2);
+      await waitFor(() => !video.isConnected, 700, "trimmed video ends");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it.each(["replace", "coexist"])("applies end-only trim to %s media", async (queue) => {
+    const { document, source, waitFor, dom } = await mountOverlay();
+    try {
+      if (queue === "coexist") {
+        source.emit("reaction", reaction({ sequence: 1, durationMs: 2000 }));
+      }
+      source.emit("reaction", reaction({
+        sequence: 2, mediaFile: "sting.mp3", durationMs: 2000, clipEndMs: 80, queue,
+      }));
+      const audio = document.querySelector("#stage audio") as HTMLAudioElement;
+      await waitFor(() => !audio.isConnected, 700, "end-only trim removes audio");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it.each(["replace", "coexist"])("pauses trimmed %s audio at the start of its exit animation", async (queue) => {
+    const { document, source, paused, waitFor, dom } = await mountOverlay();
+    try {
+      if (queue === "coexist") source.emit("reaction", reaction({ sequence: 1, durationMs: 2000 }));
+      source.emit("reaction", reaction({
+        sequence: 2, mediaFile: "sting.mp3", durationMs: 2000, clipEndMs: 80, queue,
+      }));
+      const audio = document.querySelector("#stage audio") as HTMLAudioElement;
+      await waitFor(() => audio.parentElement?.classList.contains("effect--leaving") === true, 500);
+      expect(audio.isConnected).toBe(true);
+      expect(paused).toContain(audio);
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it.each(["clip.webm", "sting.mp3"])("honors muted for main and coexist %s", async (mediaFile) => {
+    const { source, playback, waitFor, dom } = await mountOverlay();
+    try {
+      source.emit("reaction", reaction({ sequence: 1, mediaFile, durationMs: 2000, muted: true, volume: 0.25 }));
+      source.emit("reaction", reaction({ sequence: 2, mediaFile, durationMs: 2000, queue: "coexist", muted: true, volume: 0.25 }));
+      await waitFor(() => playback.length === 2);
+      expect(playback.map((entry) => entry.muted)).toEqual([true, true]);
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it.each(["clip.webm", "sting.mp3"])("honors volume for main and coexist %s", async (mediaFile) => {
+    const { source, playback, waitFor, dom } = await mountOverlay();
+    try {
+      source.emit("reaction", reaction({ sequence: 1, mediaFile, durationMs: 2000, volume: 0.25 }));
+      source.emit("reaction", reaction({ sequence: 2, mediaFile, durationMs: 2000, queue: "coexist", volume: 0.25 }));
+      await waitFor(() => playback.length === 2);
+      expect(playback.map((entry) => entry.media.volume)).toEqual([0.25, 0.25]);
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it.each([null, "sting.mp3"])("uses template artwork for coexist %s", async (mediaFile) => {
+    const { document, source, dom } = await mountOverlay();
+    try {
+      source.emit("reaction", reaction({ sequence: 1, durationMs: 2000 }));
+      source.emit("reaction", reaction({ sequence: 2, mediaFile, durationMs: 2000, queue: "coexist" }));
+      const images = Array.from(document.querySelectorAll("#stage img"));
+      expect(images).toHaveLength(2);
+      for (const image of images) {
+        expect(new URL((image as HTMLImageElement).src).pathname).toMatch(/\/templates\/wow-1\.png$/);
+      }
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("does not start an image removed before its load completes", async () => {
+    const { document, source, window, dom } = await mountOverlay();
+    let tones = 0;
+    (window as unknown as Record<string, unknown>).AudioContext = class {
+      constructor() { tones += 1; }
+    };
+    try {
+      source.emit("reaction", reaction({ sequence: 1, durationMs: 2000 }));
+      const image = document.querySelector("#stage img") as HTMLImageElement;
+      source.emit("reaction", reaction({ sequence: 2, mediaFile: "clip.webm", durationMs: 2000 }));
+      expect(image.isConnected).toBe(false);
+      image.dispatchEvent(new window.Event("load"));
+      expect(tones).toBe(0);
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it.each(["replace", "coexist"])("does not restart %s video removed while awaiting metadata", async (queue) => {
+    const { document, source, playback, window, dom } = await mountOverlay();
+    try {
+      if (queue === "coexist") source.emit("reaction", reaction({ sequence: 1, durationMs: 2000 }));
+      source.emit("reaction", reaction({
+        sequence: 2, mediaFile: "clip.webm", durationMs: 2000, clipStartMs: 1200, queue,
+      }));
+      const video = document.querySelector("#stage video") as HTMLVideoElement;
+      source.emit("reaction", reaction({ sequence: 3, mediaFile: "sting.mp3", durationMs: 2000 }));
+      expect(video.isConnected).toBe(false);
+      Object.defineProperty(video, "readyState", { value: 1 });
+      video.dispatchEvent(new window.Event("loadedmetadata"));
+      await Promise.resolve();
+      expect(playback.filter((entry) => entry.media === video)).toHaveLength(0);
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("pauses a removed video again if its pending play promise resolves", async () => {
+    let resolvePlay: (() => void) | undefined;
+    const pending = new Promise<void>((resolve) => { resolvePlay = resolve; });
+    const { document, source, playback, paused, waitFor, dom } = await mountOverlay(
+      (media) => media.tagName === "VIDEO" ? pending : Promise.resolve()
+    );
+    try {
+      source.emit("reaction", reaction({ sequence: 1, mediaFile: "clip.webm", durationMs: 2000 }));
+      const video = document.querySelector("#stage video") as HTMLVideoElement;
+      await waitFor(() => playback.some((entry) => entry.media === video));
+      source.emit("reaction", reaction({ sequence: 2, mediaFile: "sting.mp3", durationMs: 2000 }));
+      expect(video.isConnected).toBe(false);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const pausesBeforeResolution = paused.filter((media) => media === video).length;
+      resolvePlay?.();
+      await waitFor(() => paused.filter((media) => media === video).length > pausesBeforeResolution);
+      expect(video.getAttribute("src")).toBeNull();
     } finally {
       dom.window.close();
     }

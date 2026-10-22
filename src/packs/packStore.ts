@@ -23,11 +23,12 @@ function emptyLibrary(): PackLibrary {
  * registry (`src/editor/mediaLibrary.ts`) and are never written here, so a
  * 5 MB localStorage quota can never fill with video binaries.
  */
-export function loadLibrary(storage: Storage = localStorage): PackLibrary {
-  const raw = storage.getItem(STORAGE_KEY);
-  const activeRaw = storage.getItem(ACTIVE_KEY);
-  if (!raw) return { ...emptyLibrary(), activePackId: activeRaw };
+export function loadLibrary(storage?: Storage): PackLibrary {
   try {
+    const availableStorage = storage ?? localStorage;
+    const raw = availableStorage.getItem(STORAGE_KEY);
+    const activeRaw = availableStorage.getItem(ACTIVE_KEY);
+    if (!raw) return emptyLibrary();
     const parsed: unknown = JSON.parse(raw);
     if (
       typeof parsed !== "object" ||

@@ -3,6 +3,7 @@ import { describe, it, expect } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { request } from "node:http";
 import { api, register, createWorkspace, samplePack, wavBytes, startTestApp } from "./test-helpers.ts";
 import { createSaasApp, validateProductionConfig } from "./app.ts";
 import { MemoryStore } from "./store.ts";
@@ -148,13 +149,16 @@ describe("saas session inventory (M7.1)", () => {
 
 describe("saas production gate and email providers (M7.1)", () => {
   it("fails closed when production configuration is incomplete", () => {
-    const full = { nodeEnv: "production", sessionSecret: "x".repeat(40), cookieSecure: true, databaseUrl: "postgres://db/x", emailConfigured: true, persistentStore: true };
+    const full = { nodeEnv: "production", sessionSecret: "x".repeat(40), cookieSecure: true, databaseUrl: "postgres://db/x", emailConfigured: true, persistentStore: true, appBaseUrl: "https://app.example.com" };
     expect(() => validateProductionConfig(full)).not.toThrow();
     expect(() => validateProductionConfig({ ...full, sessionSecret: "short" })).toThrow(/SESSION_SECRET/);
     expect(() => validateProductionConfig({ ...full, cookieSecure: false })).toThrow(/COOKIE_SECURE/);
     expect(() => validateProductionConfig({ ...full, databaseUrl: "" })).toThrow(/DATABASE_URL/);
     expect(() => validateProductionConfig({ ...full, persistentStore: false })).toThrow(/persistent store/);
     expect(() => validateProductionConfig({ ...full, emailConfigured: false })).toThrow(/SMTP_HOST/);
+    for (const appBaseUrl of ["", "not-a-url", "javascript:alert(1)", "https://user:pass@app.example.com", "https://app.example.com/#attacker"]) {
+      expect(() => validateProductionConfig({ ...full, appBaseUrl })).toThrow(/APP_BASE_URL/);
+    }
     expect(() => validateProductionConfig({ ...full, nodeEnv: "test" })).not.toThrow();
   });
 
@@ -176,6 +180,30 @@ describe("saas production gate and email providers (M7.1)", () => {
     await mail.sendPasswordReset("u@example.com", resetUrlFor("https://app.example.com", "abc123"), Date.now() + 1000);
     expect(mail.tokenFor("u@example.com")).toBe("abc123");
     expect(mail.tokenFor("nobody@example.com")).toBeNull();
+  });
+
+  it.each(["", "https://app.example.com/dashboard"])("ignores the request Host when building recovery links (%s)", async (appBaseUrl) => {
+    const email = new InMemoryEmailProvider();
+    const storage = new FilesystemStorage(mkdtempSync(join(tmpdir(), "saas-recovery-host-")));
+    const app = createSaasApp({ store: new MemoryStore(), storage, email, appBaseUrl });
+    const { base } = await app.listen(0);
+    try {
+      await register(base, "host@example.com");
+      const status = await new Promise<number | undefined>((resolve, reject) => {
+        const req = request(`${base}/api/auth/recover/request`, { method: "POST", headers: { Host: "attacker.example", "Content-Type": "application/json" } }, (res) => {
+          res.resume();
+          res.on("end", () => resolve(res.statusCode));
+        });
+        req.on("error", reject);
+        req.end(JSON.stringify({ email: "host@example.com" }));
+      });
+      expect(status).toBe(200);
+      expect(email.sent).toHaveLength(1);
+      const expectedBase = appBaseUrl || "http://127.0.0.1:1420";
+      expect(email.sent[0].resetUrl).toBe(resetUrlFor(expectedBase, email.tokenFor("host@example.com")!));
+    } finally {
+      await app.close();
+    }
   });
 
   it("delivers recovery mail over real SMTP", async () => {

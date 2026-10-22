@@ -13,7 +13,7 @@ test.setTimeout(120000);
 
 test.beforeAll(async () => {
   browser = await chromium.launch({
-    channel: "chrome",
+    executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
     args: ["--no-sandbox", "--autoplay-policy=no-user-gesture-required", "--mute-audio", "--disable-dev-shm-usage"],
   });
   const sourceDir = mkdtempSync(join(tmpdir(), "saas-e2e-src-"));
@@ -255,5 +255,39 @@ test("hosted account → pack → media → overlay slice with tenant isolation"
     await expect(app.getByText("Cloud Pack").first()).toBeAttached({ timeout: 15000 });
   } finally {
     await app.close();
+  }
+});
+
+test("web cookie sign-in restores after reload and supports CSRF-protected writes", async () => {
+  const context = await browser.newContext();
+  const app = await context.newPage();
+  try {
+    const webBase = backend.base.replace("127.0.0.1", "localhost");
+    await app.addInitScript((base) => {
+      localStorage.setItem("live-edits.saas.auth-mode", "web");
+      localStorage.setItem("live-edits.saas.base", base);
+    }, webBase);
+    await app.goto("http://localhost:1420/", { waitUntil: "domcontentloaded" });
+    await app.getByRole("button", { name: "Cloud", exact: true }).click();
+    await app.getByLabel("Cloud email").fill("cookie-restore@example.com");
+    await app.getByLabel("Cloud password").fill("correct-horse-99");
+    await app.getByRole("button", { name: "Register", exact: true }).click();
+    await expect(app.getByRole("button", { name: "Sign out", exact: true })).toBeVisible();
+    await app.getByLabel("New workspace name").fill("Cookie workspace");
+    await app.getByRole("button", { name: "Create workspace", exact: true }).click();
+    await expect(app.getByRole("option", { name: /Cookie workspace/ })).toBeAttached();
+    expect(await app.evaluate(() => localStorage.getItem("live-edits.saas.token"))).toBeNull();
+    expect(await app.evaluate(() => document.cookie)).not.toContain("le_session");
+    await app.reload({ waitUntil: "domcontentloaded" });
+    await app.getByRole("button", { name: "Cloud", exact: true }).click();
+    await expect(app.getByRole("button", { name: "Sign out", exact: true })).toBeVisible();
+    await expect(app.getByRole("option", { name: /Cookie workspace/ })).toBeAttached();
+    await app.getByRole("button", { name: "Sign out", exact: true }).click();
+    await expect(app.getByRole("button", { name: "Sign in", exact: true })).toBeVisible();
+    await app.reload({ waitUntil: "domcontentloaded" });
+    await app.getByRole("button", { name: "Cloud", exact: true }).click();
+    await expect(app.getByRole("button", { name: "Sign in", exact: true })).toBeVisible();
+  } finally {
+    await context.close();
   }
 });

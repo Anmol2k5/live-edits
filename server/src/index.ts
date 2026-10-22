@@ -27,6 +27,7 @@ if (nodeEnv === "production") {
     databaseUrl,
     emailConfigured: (process.env["SMTP_HOST"] || "").trim().length > 0,
     persistentStore: databaseUrl.length > 0,
+    appBaseUrl,
   });
 }
 

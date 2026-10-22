@@ -45,6 +45,26 @@ describe("useMomentDetector guards (M1)", () => {
     expect(result.current.modelsReady).toBe(false);
   });
 
+  it("applies changed detector thresholds while polling is active", async () => {
+    vi.useFakeTimers();
+    try {
+      mockDetect.mockResolvedValue({ neutral: 0, happy: 0, sad: 0, surprised: 0.8, angry: 0, disgusted: 0, fearful: 0 });
+      const ref = { current: fakeVideo() };
+      const { result, rerender } = renderHook(
+        ({ wowThreshold }) => useMomentDetector(ref, true, { wowThreshold }),
+        { initialProps: { wowThreshold: 0.99 } }
+      );
+      await act(async () => { await Promise.resolve(); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(800); });
+      expect(result.current.lastEvent).toBeNull();
+      rerender({ wowThreshold: 0.7 });
+      await act(async () => { await vi.advanceTimersByTimeAsync(800); });
+      expect(result.current.lastEvent?.moment).toBe("wow");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("skips a tick while inference is still in flight (no overlap)", async () => {
     vi.useFakeTimers();
     try {

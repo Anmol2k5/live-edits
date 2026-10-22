@@ -32,9 +32,9 @@ export default defineConfig({
       testMatch: /(overlay|editor|saas)\.spec\.ts/,
       use: {
         browserName: "chromium",
-        channel: "chrome",
         headless: true,
         launchOptions: {
+          executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
           args: [...baseArgs, "--autoplay-policy=no-user-gesture-required"],
         },
         screenshot: "only-on-failure",
@@ -49,9 +49,9 @@ export default defineConfig({
       testMatch: /policy\.spec\.ts/,
       use: {
         browserName: "chromium",
-        channel: "chrome",
         headless: true,
         launchOptions: {
+          executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
           args: baseArgs,
         },
         screenshot: "only-on-failure",

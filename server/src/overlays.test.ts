@@ -154,7 +154,9 @@ describe("saas overlay reliability (M7.1)", () => {
     try {
       const a = await register(app.base, "full@example.com");
       const ws = await createWorkspace(app.base, a.token, "Full");
-      await api(app.base, "POST", `/api/workspaces/${ws}/packs`, a.token, samplePack());
+      const pack = samplePack();
+      (pack.effects as Array<{ muted: boolean }>)[0].muted = true;
+      await api(app.base, "POST", `/api/workspaces/${ws}/packs`, a.token, pack);
       await api(app.base, "POST", `/api/workspaces/${ws}/activate`, a.token, { packUid: "pack-1" });
       expect(await upload(app.base, a.token, ws, "clip.wav", wavBytes(2000))).toBe(201);
       const mk = await api(app.base, "POST", `/api/workspaces/${ws}/overlays`, a.token, { name: "Main" });
@@ -182,6 +184,15 @@ describe("saas overlay reliability (M7.1)", () => {
       expect(text).toMatch(/"clipStartMs":200/);
       expect(text).toMatch(/"clipEndMs":2200/);
       expect(text).toMatch(/"effectId":"clip-1"/);
+      expect(text).toMatch(/"muted":true/);
+      expect((await api(app.base, "POST", `/api/workspaces/${ws}/trigger`, a.token, { moment: "wow", muted: "false" })).status).toBe(400);
+      expect((await api(app.base, "POST", `/api/workspaces/${ws}/trigger`, a.token, { moment: "wow", muted: false })).status).toBe(202);
+      let override = "";
+      while (!/event: reaction/.test(override)) {
+        const { value } = (await reader?.read()) as { value?: Uint8Array };
+        override += new TextDecoder().decode(value);
+      }
+      expect(override).toMatch(/"muted":false/);
       await reader?.cancel().catch(() => undefined);
     } finally {
       await app.close();

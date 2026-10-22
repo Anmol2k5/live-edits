@@ -10,6 +10,22 @@ import {
 } from "../packSchemas";
 
 describe("reaction packs (M6)", () => {
+  it("reserves untouched incoming IDs while rewriting collisions", () => {
+    const pack = parsePack({
+      ...createPack("Imported"),
+      effects: [
+        { id: "a", name: "First", kind: "frame", templateId: "wow-1", moment: "wow" },
+        { id: "a-imported-2", name: "Second", kind: "frame", templateId: "wow-2", moment: "wow" },
+      ],
+      assignments: [{ id: "rule", source: "manual", effectId: "a" }],
+      sequence: [{ id: "step", effectId: "a-imported-2", delayMs: 0 }],
+    });
+    const imported = importPack(pack, { packIds: new Set(), effectIds: new Set(["a"]) });
+    expect(new Set(imported.effects.map((e) => e.id)).size).toBe(2);
+    expect(imported.effects[1]?.id).toBe("a-imported-2");
+    expect(imported.assignments[0]?.effectId).toBe(imported.effects[0]?.id);
+    expect(imported.sequence[0]?.effectId).toBe("a-imported-2");
+  });
   it("creates, renames and duplicates packs", () => {
     const pack = createPack("  My Pack  ");
     expect(pack.version).toBe(PACK_VERSION);

@@ -1,6 +1,12 @@
 // @vitest-environment node
 import { describe, it, expect } from "vitest";
 import { api, register, createWorkspace, wavBytes, startTestApp } from "./test-helpers.ts";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createSaasApp } from "./app.ts";
+import { MemoryStore } from "./store.ts";
+import { FilesystemStorage } from "./storage.ts";
 
 async function upload(base: string, token: string, ws: string, name: string, body: Buffer, contentType = "audio/wav"): Promise<{ status: number; json: unknown }> {
   const response = await fetch(`${base}/api/workspaces/${ws}/media`, {
@@ -37,6 +43,16 @@ describe("saas media (M7)", () => {
       const signed = await api(app.base, "POST", `/api/workspaces/${ws}/media/clip.wav/signed-url`, a.token);
       expect(signed.status).toBe(200);
       expect((signed.json as { signature: string }).signature).toMatch(/^[0-9a-f]{64}$/);
+      const overlay = await api(app.base, "POST", `/api/workspaces/${ws}/overlays`, a.token, { name: "Signed media" });
+      const overlayId = (overlay.json as { overlay: { id: string } }).overlay.id;
+      const { signature, expiresAt } = signed.json as { signature: string; expiresAt: number };
+      const signedPath = `${app.base}/o/${overlayId}/media/clip.wav?exp=${expiresAt}&sig=${signature}`;
+      const signedMedia = await fetch(signedPath);
+      expect(signedMedia.status).toBe(200);
+      expect(Buffer.from(await signedMedia.arrayBuffer())).toEqual(wavBytes(4096));
+      const tampered = await fetch(signedPath.replace(signature, "0".repeat(64)));
+      expect(tampered.status).toBe(403);
+      await tampered.arrayBuffer();
 
       // Duplicate names are refused, never silently overwritten.
       const dup = await upload(app.base, a.token, ws, "clip.wav", wavBytes(100, 9));
@@ -102,6 +118,70 @@ describe("saas media (M7)", () => {
       expect(list.map((m) => m.name)).toContain("a.wav");
       expect(wsB).toBeTruthy();
     } finally {
+      await app.close();
+    }
+  });
+
+  it.each(["upload", "replace"])("enforces the workspace quota during concurrent %ss", async (operation) => {
+    const app = await startTestApp({ quotaBytes: 800 });
+    try {
+      const user = await register(app.base, "quota-race@example.com");
+      const ws = await createWorkspace(app.base, user.token, "Concurrent quota");
+      if (operation === "replace") {
+        expect((await upload(app.base, user.token, ws, "a.wav", wavBytes(100))).status).toBe(201);
+        expect((await upload(app.base, user.token, ws, "b.wav", wavBytes(100))).status).toBe(201);
+      }
+      const write = async (name: string) => {
+        if (operation === "upload") return (await upload(app.base, user.token, ws, name, wavBytes(400))).status;
+        const response = await fetch(`${app.base}/api/workspaces/${ws}/media/${name}`, {
+          method: "PUT", headers: { Authorization: `Bearer ${user.token}`, "Content-Type": "audio/wav" }, body: new Uint8Array(wavBytes(400)),
+        });
+        await response.arrayBuffer();
+        return response.status;
+      };
+      const statuses = await Promise.all([write("a.wav"), write("b.wav")]);
+      expect(statuses).toContain(413);
+      expect(statuses.filter((status) => status === (operation === "upload" ? 201 : 200))).toHaveLength(1);
+      const list = await api(app.base, "GET", `/api/workspaces/${ws}/media`, user.token);
+      const media = (list.json as { media: Array<{ bytes: number }> }).media;
+      expect(media.reduce((sum, item) => sum + item.bytes, 0)).toBeLessThanOrEqual(800);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("waits for a pending delete before reusing the same media name", async () => {
+    let deleting!: () => void;
+    let finishDelete!: () => void;
+    const deleteStarted = new Promise<void>((resolve) => { deleting = resolve; });
+    const deleteReleased = new Promise<void>((resolve) => { finishDelete = resolve; });
+    class PausedDeleteStorage extends FilesystemStorage {
+      override async remove(workspaceId: string, name: string): Promise<boolean> {
+        deleting();
+        await deleteReleased;
+        return super.remove(workspaceId, name);
+      }
+    }
+    const storage = new PausedDeleteStorage(mkdtempSync(join(tmpdir(), "saas-delete-race-")));
+    const app = createSaasApp({ store: new MemoryStore(), storage });
+    const { base } = await app.listen(0);
+    try {
+      const user = await register(base, "delete-race@example.com");
+      const ws = await createWorkspace(base, user.token, "Delete and upload");
+      expect((await upload(base, user.token, ws, "same.wav", wavBytes(100))).status).toBe(201);
+      const deletion = api(base, "DELETE", `/api/workspaces/${ws}/media/same.wav`, user.token);
+      await deleteStarted;
+      const replacement = upload(base, user.token, ws, "same.wav", wavBytes(400, 9));
+      const earlyResult = await Promise.race([replacement, new Promise<null>((resolve) => setTimeout(() => resolve(null), 50))]);
+      finishDelete();
+      expect(earlyResult).toBeNull();
+      expect((await deletion).status).toBe(200);
+      expect((await replacement).status).toBe(201);
+      const file = await fetch(`${base}/api/workspaces/${ws}/media/same.wav`, { headers: { Authorization: `Bearer ${user.token}` } });
+      expect(file.status).toBe(200);
+      expect(Buffer.from(await file.arrayBuffer())).toEqual(wavBytes(400, 9));
+    } finally {
+      finishDelete();
       await app.close();
     }
   });

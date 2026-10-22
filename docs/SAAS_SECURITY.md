@@ -85,7 +85,7 @@
   revocation; Range/416 behavior; revocation during playback; burst
   ordering across workspaces; the real-browser slice with reconnect, rotate,
   revoke, and reload.
-- S3 provider path runs against `moto_server` locally and `minio/minio` in
+- S3 provider path runs against `moto_server` locally and a pinned MinIO source build in
   CI — both genuine S3-protocol services, not in-process mocks.
 - NOT verified here: production Postgres operations at scale, S3 at scale,
   SSO/MFA, multi-instance rate-limit sharing (in-memory buckets need sticky

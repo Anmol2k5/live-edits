@@ -5,6 +5,7 @@ import {
   fireEvent,
   waitFor,
   cleanup,
+  act,
 } from "@testing-library/react";
 import { useState } from "react";
 import { ReactionEditor } from "../ReactionEditor";
@@ -28,14 +29,16 @@ function Harness({
   relayReady = true,
   relayBase = "http://127.0.0.1:4190",
   publishToken = "",
+  mediaRegistry,
 }: {
   fired: Fired[];
   relayReady?: boolean;
   relayBase?: string;
   publishToken?: string;
+  mediaRegistry?: MediaRegistry;
 }) {
   const [library, setLibrary] = useState<PackLibrary>(emptyLibrary());
-  const [media] = useState(() => new MediaRegistry());
+  const [media] = useState(() => mediaRegistry ?? new MediaRegistry());
   const [, setVersion] = useState(0);
   return (
     <ReactionEditor
@@ -203,6 +206,84 @@ describe("ReactionEditor workflow (M6)", () => {
     expect(
       (screen.getByLabelText("Reaction pack") as HTMLSelectElement).value
     ).toBe(packOptionId("Two"));
+    expect(screen.getByRole("option", { name: "One" })).toBeTruthy();
+    expect(screen.queryByRole("option", { name: "One!" })).toBeNull();
+  });
+
+  it("saves the draft and completes a pending pack switch", () => {
+    setup();
+    createPackNamed("One");
+    createPackNamed("Two");
+    fireEvent.change(screen.getByLabelText("Reaction pack"), {
+      target: { value: packOptionId("One") },
+    });
+    fireEvent.change(screen.getByLabelText("New pack name"), { target: { value: "One!" } });
+    fireEvent.click(screen.getByText("Rename"));
+    fireEvent.change(screen.getByLabelText("Reaction pack"), {
+      target: { value: packOptionId("Two") },
+    });
+    fireEvent.click(screen.getByText("Save & switch"));
+    expect(screen.queryByText(/Save first\?/)).toBeNull();
+    expect((screen.getByLabelText("Reaction pack") as HTMLSelectElement).value)
+      .toBe(packOptionId("Two"));
+    expect(screen.getByRole("option", { name: "One!" })).toBeTruthy();
+  });
+
+  it("keeps a paused sequence cue visible until its remaining playback completes", () => {
+    vi.useFakeTimers();
+    try {
+      setup();
+      createPackNamed("Sequence");
+      fireEvent.change(screen.getByLabelText("New effect kind"), { target: { value: "frame" } });
+      fireEvent.click(screen.getByText("Create effect"));
+      fireEvent.click(screen.getByText("Add step"));
+      fireEvent.click(screen.getByText("Play", { selector: "button" }));
+      act(() => vi.advanceTimersByTime(1000));
+      fireEvent.click(screen.getByText("Pause", { selector: "button" }));
+      act(() => vi.advanceTimersByTime(9000));
+      expect(screen.getByTestId("preview-stage").querySelector("img")).not.toBeNull();
+      expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe("13");
+      fireEvent.click(screen.getByText("Play", { selector: "button" }));
+      act(() => vi.advanceTimersByTime(7000));
+      expect(screen.getByTestId("preview-stage").querySelector("img")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("restarts repeated video cues and seeks the preview to the sequence offset", () => {
+    vi.useFakeTimers();
+    const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue();
+    const pause = vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
+    try {
+      setup();
+      createPackNamed("Sequence media");
+      fireEvent.change(screen.getByLabelText("Import media files"), {
+        target: { files: [webmFile()] },
+      });
+      fireEvent.click(screen.getByText("Create effect"));
+      fireEvent.blur(screen.getByLabelText("Cooldown milliseconds"), { target: { value: "0" } });
+      fireEvent.blur(screen.getByLabelText("Trim start milliseconds"), { target: { value: "200" } });
+      fireEvent.click(screen.getByText("Add step"));
+      fireEvent.click(screen.getByText("Add step"));
+      fireEvent.click(screen.getByText("Play", { selector: "button" }));
+      const video = screen.getByTestId("preview-stage").querySelector("video") as HTMLVideoElement;
+      Object.defineProperty(video, "readyState", { value: 1 });
+      fireEvent.loadedMetadata(video);
+      video.currentTime = 2.5;
+      act(() => vi.advanceTimersByTime(2700));
+      expect(video.currentTime).toBe(0.2);
+      fireEvent.change(screen.getByLabelText("Sequence position"), { target: { value: "3200" } });
+      expect(screen.getByTestId("preview-stage").querySelector("video")).toBe(video);
+      expect(video.currentTime).toBe(0.7);
+      fireEvent.click(screen.getByText("Play", { selector: "button" }));
+      expect(video.currentTime).toBe(0.7);
+    } finally {
+      cleanup();
+      play.mockRestore();
+      pause.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it("blocks firing without a relay token and guides empty states", () => {
@@ -333,6 +414,23 @@ describe("ReactionEditor relay transfer (M6.1)", () => {
     // No token: no Send happens, and the button is disabled with guidance.
     expect(screen.getByText("Send to relay")).toBeTruthy();
     expect((screen.getByText("Send to relay") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("retains imported bytes across editor remounts so they can be sent later", async () => {
+    const state = relayFetch({ inventory: [], uploads: [], deletes: [] });
+    const media = new MediaRegistry();
+    const first = render(<Harness fired={[]} mediaRegistry={media} />);
+    createPackNamed("Local");
+    fireEvent.change(screen.getByLabelText("Import media files"), {
+      target: { files: [wavFile()] },
+    });
+    await waitFor(() => expect(screen.getByText("sting.wav")).toBeTruthy());
+    first.unmount();
+    render(<Harness fired={[]} mediaRegistry={media} publishToken="token" />);
+    createPackNamed("Return");
+    fireEvent.click(screen.getByText("Send to relay"));
+    await waitFor(() => expect(state.uploads).toEqual(["sting.wav"]));
+    expect(screen.queryByText(/File bytes are gone/)).toBeNull();
   });
 
   it("surfaces relay conflicts with a confirmed replace path", async () => {

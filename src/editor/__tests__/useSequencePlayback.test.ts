@@ -129,4 +129,89 @@ describe("useSequencePlayback (M6)", () => {
     expect(result.current.status).toBe("idle");
     expect(result.current.skippedStepIds).toContain("s2");
   });
+
+  it("resumes the admitted cue without replaying it or applying cooldown again", () => {
+    const effects = [video("a", 1000, { cooldownMs: 10_000 })];
+    const steps: SequenceStep[] = [{ id: "s1", effectId: "a", delayMs: 0 }];
+    const onCueStart = vi.fn();
+    const onCueEnd = vi.fn();
+    const onSkipped = vi.fn();
+    const { result } = renderHook(() =>
+      useSequencePlayback(steps, effects, { onCueStart, onCueEnd, onSkipped })
+    );
+    act(() => result.current.play());
+    act(() => vi.advanceTimersByTime(400));
+    act(() => result.current.pause());
+    act(() => vi.advanceTimersByTime(1000));
+    act(() => result.current.play());
+    expect(result.current.elapsedMs).toBe(400);
+    expect(onCueStart).toHaveBeenCalledTimes(1);
+    expect(onSkipped).not.toHaveBeenCalled();
+    act(() => vi.advanceTimersByTime(600));
+    expect(result.current.status).toBe("idle");
+    expect(onCueEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it("replays a finished sequence from the beginning after a paused run", () => {
+    const effects = [video("a", 1000)];
+    const steps: SequenceStep[] = [{ id: "s1", effectId: "a", delayMs: 0 }];
+    const onCueStart = vi.fn();
+    const { result } = renderHook(() =>
+      useSequencePlayback(steps, effects, { onCueStart })
+    );
+    act(() => result.current.play());
+    act(() => vi.advanceTimersByTime(400));
+    act(() => result.current.pause());
+    act(() => result.current.play());
+    act(() => vi.advanceTimersByTime(600));
+    expect(result.current.status).toBe("idle");
+    act(() => result.current.play());
+    expect(result.current.elapsedMs).toBe(0);
+    expect(onCueStart).toHaveBeenCalledTimes(2);
+  });
+
+  it("ends the active cue when a timeline edit cancels playback", () => {
+    const effects = [video("a", 1000)];
+    const steps: SequenceStep[] = [{ id: "s1", effectId: "a", delayMs: 0 }];
+    const onCueEnd = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ timeline }) => useSequencePlayback(timeline, effects, { onCueEnd }),
+      { initialProps: { timeline: steps } }
+    );
+    act(() => result.current.play());
+    rerender({ timeline: [] });
+    expect(result.current.status).toBe("idle");
+    expect(onCueEnd).toHaveBeenCalledOnce();
+    expect(onCueEnd.mock.calls[0]?.[0].stepId).toBe("s1");
+  });
+
+  it("can seek back to an admitted cue without treating it as a duplicate", () => {
+    const effects = [video("a", 1000, { cooldownMs: 10_000 })];
+    const steps: SequenceStep[] = [{ id: "s1", effectId: "a", delayMs: 0 }];
+    const onCueStart = vi.fn();
+    const onSkipped = vi.fn();
+    const { result } = renderHook(() =>
+      useSequencePlayback(steps, effects, { onCueStart, onSkipped })
+    );
+    act(() => result.current.play());
+    act(() => result.current.seek(500));
+    expect(onCueStart).toHaveBeenCalledTimes(2);
+    expect(onCueStart.mock.calls[1]?.[1]).toBe(500);
+    expect(result.current.status).toBe("paused");
+    act(() => result.current.play());
+    expect(onCueStart).toHaveBeenCalledTimes(2);
+    expect(onSkipped).not.toHaveBeenCalled();
+  });
+
+  it("starts a cue at its elapsed offset when a timer reaches it late", () => {
+    const effects = [video("a", 1000)];
+    const steps: SequenceStep[] = [{ id: "s1", effectId: "a", delayMs: 150 }];
+    const onCueStart = vi.fn();
+    const { result } = renderHook(() =>
+      useSequencePlayback(steps, effects, { onCueStart })
+    );
+    act(() => result.current.play());
+    act(() => vi.advanceTimersByTime(200));
+    expect(onCueStart.mock.calls[0]?.[1]).toBe(50);
+  });
 });

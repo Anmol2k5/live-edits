@@ -26,6 +26,16 @@ export interface ProductionConfig {
   databaseUrl: string;
   emailConfigured: boolean;
   persistentStore: boolean;
+  appBaseUrl: string;
+}
+
+function validAppBaseUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (url.protocol === "http:" || url.protocol === "https:") && !url.username && !url.password && !url.search && !url.hash;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -43,6 +53,7 @@ export function validateProductionConfig(cfg: ProductionConfig): void {
   if (!cfg.databaseUrl) problems.push("DATABASE_URL is required (no memory store in production).");
   if (!cfg.persistentStore) problems.push("A persistent store is required in production.");
   if (!cfg.emailConfigured) problems.push("SMTP_HOST (+ user/pass/from) is required for password recovery.");
+  if (!validAppBaseUrl(cfg.appBaseUrl)) problems.push("APP_BASE_URL must be an HTTP(S) URL without credentials, a query, or a fragment.");
   if (problems.length > 0) {
     throw new Error(`Refusing to start in production:\n- ${problems.join("\n- ")}`);
   }
@@ -260,7 +271,10 @@ export function createSaasApp(opts: SaasOptions = {}): {
   const corsOrigins = new Set(opts.corsOrigins ?? ["http://localhost:1420", "http://127.0.0.1:1420", "http://tauri.localhost", "tauri://localhost"]);
   const cookieSecure = (process.env["LIVE_EDITS_COOKIE_SECURE"] ?? "") === "1";
   const email: EmailProvider = opts.email ?? new LoggingEmailProvider();
-  const appBaseUrl = (opts.appBaseUrl ?? process.env["APP_BASE_URL"] ?? "").trim();
+  const configuredBaseUrl = (opts.appBaseUrl ?? process.env["APP_BASE_URL"] ?? "").trim();
+  if (configuredBaseUrl && !validAppBaseUrl(configuredBaseUrl)) throw new Error("APP_BASE_URL must be an HTTP(S) URL without credentials, a query, or a fragment.");
+  if (!configuredBaseUrl && process.env["NODE_ENV"] === "production") throw new Error("APP_BASE_URL is required for password recovery in production.");
+  const appBaseUrl = configuredBaseUrl || "http://127.0.0.1:1420";
   const bootId = randomBytes(8).toString("hex");
   const hub = new OverlayHub(bootId);
   const buckets = new Map<string, RateBucket>();
@@ -404,19 +418,18 @@ export function createSaasApp(opts: SaasOptions = {}): {
           const token = newToken(24);
           await store.createReset(user.id, sha256Hex(token), Date.now() + RESET_TTL_MS);
           await store.recordAudit({ workspaceId: null, actorId: user.id, action: "auth.recover.request", target: user.id, meta: {} });
-          const base = appBaseUrl || `http://${req.headers.host ?? "127.0.0.1"}`;
-          await email.sendPasswordReset(user.email, resetUrlFor(base, token), Date.now() + RESET_TTL_MS);
+          await email.sendPasswordReset(user.email, resetUrlFor(appBaseUrl, token), Date.now() + RESET_TTL_MS);
         }
         return json(res, 200, { ok: true });
       }
       if (url.pathname === "/api/auth/recover/confirm" && method === "POST") {
         const input = RecoverConfirmSchema.parse(await readJson(req));
-        const row = await store.findResetByHash(sha256Hex(input.token));
+        const tokenHash = sha256Hex(input.token);
+        const row = await store.findResetByHash(tokenHash);
         if (!row || row.usedAt !== null || Date.now() > row.expiresAt) return json(res, 400, { error: "invalid or expired token" });
-        await store.updateUser(row.userId, { passwordHash: hashPassword(input.newPassword) });
-        await store.markResetUsed(row.id);
-        await store.deleteSessionsForUser(row.userId);
-        await store.recordAudit({ workspaceId: null, actorId: row.userId, action: "auth.recover.confirm", target: row.userId, meta: {} });
+        const userId = await store.consumeReset(tokenHash, hashPassword(input.newPassword));
+        if (!userId) return json(res, 400, { error: "invalid or expired token" });
+        await store.recordAudit({ workspaceId: null, actorId: userId, action: "auth.recover.confirm", target: userId, meta: {} });
         return json(res, 200, { ok: true });
       }
       if (url.pathname === "/api/auth/account" && method === "PATCH") {
@@ -490,7 +503,8 @@ export function createSaasApp(opts: SaasOptions = {}): {
         const mem = await membership(workspaceId, a.userId);
         // 404 for missing workspace AND non-members: prevents id enumeration.
         if (!mem) {
-          await store.recordAudit({ workspaceId: /^[0-9a-fA-F-]{8,64}$/.test(workspaceId) ? workspaceId : null, actorId: a.userId, action: "workspace.denied", target: url.pathname, meta: {} });
+          const workspace = /^[0-9a-fA-F-]{8,64}$/.test(workspaceId) ? await store.findWorkspace(workspaceId) : null;
+          await store.recordAudit({ workspaceId: workspace?.id ?? null, actorId: a.userId, action: "workspace.denied", target: url.pathname, meta: { requestedWorkspaceId: workspaceId } });
           return json(res, 404, { error: "not found" });
         }
         // Cookie-authenticated writes need a CSRF token; Bearer calls are exempt.
@@ -519,7 +533,13 @@ export function createSaasApp(opts: SaasOptions = {}): {
           if (role === "owner") {
             // Only an owner can grant ownership; allowed.
           }
-          const m = await store.addMember(workspaceId, user.id, role);
+          let m;
+          try {
+            m = await store.addMember(workspaceId, user.id, role);
+          } catch (err) {
+            if ((err as { code?: string }).code === "conflict") return json(res, 409, { error: (err as Error).message });
+            throw err;
+          }
           await store.recordAudit({ workspaceId, actorId: a.userId, action: "workspace.member.add", target: user.id, meta: { role } });
           return json(res, 201, { member: { userId: m.userId, role: m.role } });
         }
@@ -613,29 +633,30 @@ export function createSaasApp(opts: SaasOptions = {}): {
         }
         if (rest === "/media" && method === "POST") {
           if (!need("admin")) return json(res, 403, { error: "admin only" });
-          const rawName = req.headers["x-filename"];
-          const filename = Array.isArray(rawName) ? rawName[0] : rawName;
-          if (!filename) return json(res, 400, { error: "missing X-Filename" });
-          const name = decodeURIComponent(filename);
-          const existing = await store.findMedia(workspaceId, name);
-          if (existing) return json(res, 409, { error: "exists", existing: { name, bytes: existing.bytes } });
-          const declared = Number(req.headers["content-length"]);
-          const usage = await store.workspaceMediaBytes(workspaceId);
-          try {
-            const stored = await storage.put(workspaceId, name, req as unknown as AsyncIterable<Uint8Array>, Number.isFinite(declared) ? declared : null, usage, quotaBytes);
-            const row = await store.createMedia({ workspaceId, name, bytes: stored.bytes, kind: stored.kind, mime: String(req.headers["content-type"] || ""), version: stored.version, storageKey: stored.storageKey, uploadedBy: a.userId });
-            await store.recordAudit({ workspaceId, actorId: a.userId, action: "media.upload", target: name, meta: { bytes: stored.bytes } });
-            // Drain accounting only; storage.put consumed the stream.
-            return json(res, 201, { name, bytes: row.bytes, kind: row.kind, mime: row.mime, version: row.version });
-          } catch (err) {
-            if (err instanceof StorageError) {
-              const status = err.code === "exists" ? 409 : err.code === "quota exceeded" || err.code === "file too large" ? 413 : 400;
-              // Failed uploads never leave fragments: storage cleans tmp; nothing recorded.
-              await store.recordAudit({ workspaceId, actorId: a.userId, action: "media.upload.rejected", target: name, meta: { code: err.code } });
-              return json(res, status, { error: err.code });
+          const result = await store.withMediaLock(workspaceId, async (media) => {
+            const rawName = req.headers["x-filename"];
+            const filename = Array.isArray(rawName) ? rawName[0] : rawName;
+            if (!filename) return { status: 400, body: { error: "missing X-Filename" } };
+            const name = decodeURIComponent(filename);
+            const existing = await media.findMedia(workspaceId, name);
+            if (existing) return { status: 409, body: { error: "exists", existing: { name, bytes: existing.bytes } } };
+            const declared = Number(req.headers["content-length"]);
+            const usage = await media.workspaceMediaBytes(workspaceId);
+            try {
+              const stored = await storage.put(workspaceId, name, req as unknown as AsyncIterable<Uint8Array>, Number.isFinite(declared) ? declared : null, usage, quotaBytes);
+              const row = await media.createMedia({ workspaceId, name, bytes: stored.bytes, kind: stored.kind, mime: String(req.headers["content-type"] || ""), version: stored.version, storageKey: stored.storageKey, uploadedBy: a.userId });
+              await media.recordAudit({ workspaceId, actorId: a.userId, action: "media.upload", target: name, meta: { bytes: stored.bytes } });
+              return { status: 201, body: { name, bytes: row.bytes, kind: row.kind, mime: row.mime, version: row.version } };
+            } catch (err) {
+              if (err instanceof StorageError) {
+                const status = err.code === "exists" ? 409 : err.code === "quota exceeded" || err.code === "file too large" ? 413 : 400;
+                await media.recordAudit({ workspaceId, actorId: a.userId, action: "media.upload.rejected", target: name, meta: { code: err.code } });
+                return { status, body: { error: err.code } };
+              }
+              throw err;
             }
-            throw err;
-          }
+          });
+          return json(res, result.status, result.body);
         }
         const mediaMatch = /^\/media\/([^/]+)(\/.*)?$/.exec(rest);
         if (mediaMatch) {
@@ -649,30 +670,36 @@ export function createSaasApp(opts: SaasOptions = {}): {
           }
           if (sub === "" && method === "PUT") {
             if (!need("admin")) return json(res, 403, { error: "admin only" });
-            const row = await store.findMedia(workspaceId, mediaName);
-            if (!row) return json(res, 404, { error: "not found" });
-            const declared = Number(req.headers["content-length"]);
-            const usage = (await store.workspaceMediaBytes(workspaceId)) - row.bytes;
-            try {
-              const stored = await storage.replace(workspaceId, mediaName, req as unknown as AsyncIterable<Uint8Array>, Number.isFinite(declared) ? declared : null, usage, quotaBytes, row.version);
-              const updated = await store.updateMediaVersion(workspaceId, mediaName, stored.bytes, String(req.headers["content-type"] || row.mime), stored.storageKey);
-              await store.recordAudit({ workspaceId, actorId: a.userId, action: "media.replace", target: mediaName, meta: { bytes: stored.bytes, version: updated?.version } });
-              return json(res, 200, { name: mediaName, bytes: stored.bytes, kind: stored.kind, version: updated?.version ?? row.version });
-            } catch (err) {
-              if (err instanceof StorageError) {
-                const status = err.code === "quota exceeded" || err.code === "file too large" ? 413 : 400;
-                return json(res, status, { error: err.code });
+            const result = await store.withMediaLock(workspaceId, async (media) => {
+              const row = await media.findMedia(workspaceId, mediaName);
+              if (!row) return { status: 404, body: { error: "not found" } };
+              const declared = Number(req.headers["content-length"]);
+              const usage = (await media.workspaceMediaBytes(workspaceId)) - row.bytes;
+              try {
+                const stored = await storage.replace(workspaceId, mediaName, req as unknown as AsyncIterable<Uint8Array>, Number.isFinite(declared) ? declared : null, usage, quotaBytes, row.version);
+                const updated = await media.updateMediaVersion(workspaceId, mediaName, stored.bytes, String(req.headers["content-type"] || row.mime), stored.storageKey);
+                await media.recordAudit({ workspaceId, actorId: a.userId, action: "media.replace", target: mediaName, meta: { bytes: stored.bytes, version: updated?.version } });
+                return { status: 200, body: { name: mediaName, bytes: stored.bytes, kind: stored.kind, version: updated?.version ?? row.version } };
+              } catch (err) {
+                if (err instanceof StorageError) {
+                  const status = err.code === "quota exceeded" || err.code === "file too large" ? 413 : 400;
+                  return { status, body: { error: err.code } };
+                }
+                throw err;
               }
-              throw err;
-            }
+            });
+            return json(res, result.status, result.body);
           }
           if (sub === "" && method === "DELETE") {
             if (!need("admin")) return json(res, 403, { error: "admin only" });
-            const row = await store.deleteMedia(workspaceId, mediaName);
-            if (!row) return json(res, 404, { error: "not found" });
-            await storage.remove(workspaceId, mediaName).catch(() => undefined);
-            await store.recordAudit({ workspaceId, actorId: a.userId, action: "media.delete", target: mediaName, meta: {} });
-            return json(res, 200, { removed: true, name: mediaName });
+            const result = await store.withMediaLock(workspaceId, async (media) => {
+              const row = await media.deleteMedia(workspaceId, mediaName);
+              if (!row) return { status: 404, body: { error: "not found" } };
+              await storage.remove(workspaceId, mediaName).catch(() => undefined);
+              await media.recordAudit({ workspaceId, actorId: a.userId, action: "media.delete", target: mediaName, meta: {} });
+              return { status: 200, body: { removed: true, name: mediaName } };
+            });
+            return json(res, result.status, result.body);
           }
           if (sub === "/signed-url" && method === "POST") {
             const row = await store.findMedia(workspaceId, mediaName);
@@ -755,7 +782,7 @@ export function createSaasApp(opts: SaasOptions = {}): {
           // (media, duration, volume, trim, position, queue, priority,
           // cooldown), exactly like the local pipeline. Caller fields
           // override effect defaults.
-          let effect: { id: string; moment: string; mediaFile?: string; durationMs: number; volume: number; position: string; clipStartMs?: number; clipEndMs?: number; queue: string; priority: number; cooldownMs: number } | null = null;
+          let effect: { id: string; moment: string; mediaFile?: string; durationMs: number; volume: number; muted: boolean; position: string; clipStartMs?: number; clipEndMs?: number; queue: string; priority: number; cooldownMs: number } | null = null;
           const ws = await store.findWorkspace(workspaceId);
           const activeUid = ws?.activePackUid ?? null;
           if (activeUid) {
@@ -764,10 +791,10 @@ export function createSaasApp(opts: SaasOptions = {}): {
             if (data) {
               const readEffect = (uid: string): typeof effect => {
                 const found = data.effects.find((e) => (e as { id: string }).id === uid) as unknown as
-                  | { id: string; moment: string; mediaFile?: string; durationMs: number; volume?: number; position?: string; clipStartMs?: number; clipEndMs?: number; queue: string; priority: number; cooldownMs: number; enabled?: boolean }
+                  | { id: string; moment: string; mediaFile?: string; durationMs: number; volume?: number; muted?: boolean; position?: string; clipStartMs?: number; clipEndMs?: number; queue: string; priority: number; cooldownMs: number; enabled?: boolean }
                   | undefined;
                 if (!found || found.enabled === false) return null;
-                return { id: found.id, moment: found.moment, mediaFile: found.mediaFile, durationMs: found.durationMs, volume: found.volume ?? 1, position: found.position ?? "center", clipStartMs: found.clipStartMs, clipEndMs: found.clipEndMs, queue: found.queue, priority: found.priority, cooldownMs: found.cooldownMs };
+                return { id: found.id, moment: found.moment, mediaFile: found.mediaFile, durationMs: found.durationMs, volume: found.volume ?? 1, muted: found.muted ?? false, position: found.position ?? "center", clipStartMs: found.clipStartMs, clipEndMs: found.clipEndMs, queue: found.queue, priority: found.priority, cooldownMs: found.cooldownMs };
               };
               if (parsed.effectId) {
                 const found = readEffect(parsed.effectId);
@@ -801,6 +828,7 @@ export function createSaasApp(opts: SaasOptions = {}): {
             mediaUrl: null as string | null,
             durationMs: parsed.durationMs ?? effect?.durationMs ?? 2700,
             volume: parsed.volume ?? effect?.volume ?? 1,
+            muted: parsed.muted ?? effect?.muted ?? false,
             clipStartMs: parsed.clipStartMs ?? effect?.clipStartMs ?? null,
             clipEndMs: parsed.clipEndMs ?? effect?.clipEndMs ?? null,
             position: parsed.position ?? effect?.position ?? "center",

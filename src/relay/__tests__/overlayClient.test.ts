@@ -64,7 +64,7 @@ describe("overlayClient payload (M3)", () => {
     await publishOverlayTrigger(
       { source: "manual", templateId: "sad-1", at: 1234 },
       "token",
-      { mediaFile: "sting.mp3", volume: 0.4, durationMs: 3000 }
+      { mediaFile: "sting.mp3", volume: 0.4, durationMs: 3000, muted: true }
     );
     expect(calls[0].body).toMatchObject({
       moment: "sad",
@@ -72,6 +72,7 @@ describe("overlayClient payload (M3)", () => {
       mediaFile: "sting.mp3",
       volume: 0.4,
       durationMs: 3000,
+      muted: true,
     });
   });
 
@@ -115,7 +116,7 @@ describe("overlayClient payload (M3)", () => {
       position: "fullscreen",
       entrance: "fade",
       exit: "fade",
-      muted: false,
+      muted: true,
       clipStartMs: 200,
       clipEndMs: 2200,
     });
@@ -128,6 +129,7 @@ describe("overlayClient payload (M3)", () => {
       mediaFile: "clip.webm",
       durationMs: 3200,
       volume: 0.4,
+      muted: true,
       position: "fullscreen",
       queue: "queue",
       priority: 70,
@@ -157,11 +159,11 @@ describe("overlayClient payload (M3)", () => {
       position: "center",
       entrance: "pop",
       exit: "fade",
-      muted: false,
+      muted: true,
     });
     const event = createEffectTrigger("custom-clip", { source: "manual" });
-    await publishOverlayTrigger(event, "token", { volume: 0.9 }, pack);
-    expect(calls[0].body).toMatchObject({ volume: 0.9, durationMs: 3200 });
+    await publishOverlayTrigger(event, "token", { volume: 0.9, muted: false }, pack);
+    expect(calls[0].body).toMatchObject({ volume: 0.9, durationMs: 3200, muted: false });
   });
 
   it("rejects unknown effect ids instead of publishing blindly", async () => {
