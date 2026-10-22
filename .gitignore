@@ -11,6 +11,9 @@ node_modules
 dist
 dist-ssr
 *.local
+.tmp-pw/
+tests/e2e/output/
+test-results/
 
 # Editor directories and files
 .vscode/*

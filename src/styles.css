@@ -572,3 +572,11 @@ body {
   100% { transform: scale(1); }
 }
 
+
+/* Optional local OBS bridge: collapsed by default to preserve camera workspace. */
+.relay-settings { flex-shrink: 0; background: #161624; border-top: 1px solid var(--border-subtle); padding: 8px 18px; font-size: 12px; }
+.relay-settings summary { cursor: pointer; font-weight: 600; color: var(--text-secondary); }
+.relay-settings__fields { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 10px 0; }
+.relay-settings__fields label { display: flex; flex-direction: column; gap: 5px; flex: 1; min-width: 190px; color: var(--text-secondary); }
+.relay-settings__fields input { padding: 8px 10px; background: var(--bg-primary); border: 1px solid var(--border-glow); color: var(--text-primary); border-radius: 6px; }
+.relay-settings__fields small { max-width: 300px; color: var(--text-secondary); line-height: 1.4; }

@@ -27,12 +27,12 @@ export default defineConfig(async () => ({
       : undefined,
     watch: {
       // 3. tell Vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      ignored: ["**/src-tauri/**", "**/.tmp-pw/**", "**/tests/e2e/output/**", "**/test-results/**"],
     },
   },
   test: {
     globals: true,
     environment: "jsdom",
-    exclude: [...configDefaults.exclude, "src-tauri/**"],
+    exclude: [...configDefaults.exclude, "src-tauri/**", "scripts/**", "tests/**", "shared/**"],
   },
 }));

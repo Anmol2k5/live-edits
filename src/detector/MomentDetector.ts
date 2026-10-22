@@ -76,7 +76,8 @@ export class MomentDetector {
 
   /** Feed a new set of scores. Call this on every detection tick (~400ms). */
   tick(scores: ExpressionScores, now: number = Date.now()): void {
-    // Track happy history for rate-of-change
+    // Track happy history for rate-of-change. A "no face" frame arrives as
+    // all-zero scores and naturally drags the delta down, acting as a gap.
     this.happyHistory.push(scores.happy);
     if (this.happyHistory.length > this.config.rateWindowSize + 1) {
       this.happyHistory.shift();
@@ -138,9 +139,12 @@ export class MomentDetector {
       };
       this.onMoment?.(event);
 
-      // Immediately transition to cooldown
+      // Immediately transition to cooldown.
+      // Reset the happy baseline so a stale pre-trigger rise cannot fire
+      // "funny" immediately after cooldown without a fresh increase.
       this.state = { status: "cooldown", until: now + this.config.cooldownMs };
       this.consecutiveHit = null;
+      this.happyHistory = [scores.happy];
     } else {
       // First hit — remember for next tick
       this.consecutiveHit = best;

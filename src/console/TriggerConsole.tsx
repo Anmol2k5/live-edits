@@ -1,7 +1,7 @@
 import { useState, useCallback } from "react";
 import { TEMPLATES } from "../templates/templates";
 import { useManualTrigger } from "./useManualTrigger";
-import type { TriggerEvent } from "../trigger/TriggerEvent";
+import type { AnyTrigger } from "../hooks/useEditPipeline";
 import type { MomentType } from "../trigger/TriggerEvent";
 
 const MOMENT_ORDER = ["wow", "funny", "sad"] as const satisfies readonly MomentType[];
@@ -13,24 +13,28 @@ const MOMENT_EMOJI: Record<MomentType, string> = {
 };
 
 interface TriggerConsoleProps {
-  onTrigger: (event: TriggerEvent) => void;
+  onTrigger: (event: AnyTrigger) => void;
   disabled?: boolean;
 }
 
 /**
  * Manual trigger console — 6 buttons (one per template), grouped by moment type.
  *
+ * M2: emits the validated shared contract (`fireContract`) so the console →
+ * pipeline path exercises the same schemas the future overlay relay and
+ * backend will use. The pipeline still accepts legacy events.
+ *
  * Future direction: this same interface could accept events over a WebSocket
  * from a co-host on a second device, making the console remotely operable.
  */
 export function TriggerConsole({ onTrigger, disabled = false }: TriggerConsoleProps) {
-  const { fire } = useManualTrigger();
+  const { fireContract } = useManualTrigger();
   const [firingId, setFiringId] = useState<string | null>(null);
 
   const handlePress = useCallback(
     (templateId: string) => {
       if (disabled) return;
-      const event = fire(templateId);
+      const event = fireContract(templateId);
       if (!event) return;
 
       onTrigger(event);
@@ -39,7 +43,7 @@ export function TriggerConsole({ onTrigger, disabled = false }: TriggerConsolePr
       setFiringId(templateId);
       setTimeout(() => setFiringId(null), 200);
     },
-    [disabled, fire, onTrigger]
+    [disabled, fireContract, onTrigger]
   );
 
   return (

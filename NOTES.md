@@ -18,7 +18,7 @@ Default: 4000ms. Prevents the same expression burst from firing multiple overlay
 
 ## Rate-of-Change Window (funny)
 
-The `funnyDelta` check uses a sliding window of the last 4 `happy` scores (~1.6s). It requires that `newest - oldest ≥ 0.3`, meaning the person's happiness must have *increased* recently, not just stayed high. This prevents a relaxed smile from firing.
+The `funnyDelta` check keeps the last 4 `happy` scores (`rateWindowSize: 3` + current sample), spanning 3 × 400ms intervals ≈ 1.2s. It requires that `newest - oldest ≥ 0.3`, meaning the person's happiness must have *increased* recently, not just stayed high. This prevents a relaxed smile from firing. The baseline resets to the trigger frame on every fire so a stale pre-trigger rise cannot leak into the next window (see CHANGELOG M1).
 
 ## Test Gestures
 

@@ -1,0 +1,168 @@
+{
+  "version": 1,
+  "note": "Identical scenarios executed against src/effects/scheduler.ts (vitest) and src/effects/scheduler-core.js (node:test). Keep expectations in sync with both players.",
+  "cases": [
+    {
+      "name": "starts when idle",
+      "steps": [
+        {
+          "effect": { "id": "a", "enabled": true, "priority": 50, "queue": "replace", "cooldownMs": 0 },
+          "trigger": { "id": "t1" },
+          "now": 1000,
+          "expect": { "action": "start", "reason": "ok" }
+        }
+      ]
+    },
+    {
+      "name": "drops disabled effects",
+      "steps": [
+        {
+          "effect": { "id": "a", "enabled": false, "priority": 50, "queue": "replace", "cooldownMs": 0 },
+          "trigger": { "id": "t1" },
+          "now": 1000,
+          "expect": { "action": "drop", "reason": "disabled" }
+        }
+      ]
+    },
+    {
+      "name": "drops expired triggers",
+      "steps": [
+        {
+          "effect": { "id": "a", "enabled": true, "priority": 50, "queue": "replace", "cooldownMs": 0 },
+          "trigger": { "id": "t1", "expiresAt": 1500 },
+          "now": 2000,
+          "expect": { "action": "drop", "reason": "expired" }
+        }
+      ]
+    },
+    {
+      "name": "drops duplicate trigger ids",
+      "steps": [
+        {
+          "effect": { "id": "a", "enabled": true, "priority": 50, "queue": "replace", "cooldownMs": 0 },
+          "trigger": { "id": "same" },
+          "now": 1000,
+          "expect": { "action": "start", "reason": "ok" }
+        },
+        {
+          "effect": { "id": "b", "enabled": true, "priority": 50, "queue": "replace", "cooldownMs": 0 },
+          "trigger": { "id": "same" },
+          "now": 1100,
+          "expect": { "action": "drop", "reason": "duplicate" }
+        }
+      ]
+    },
+    {
+      "name": "enforces per-effect cooldowns",
+      "steps": [
+        {
+          "effect": { "id": "a", "enabled": true, "priority": 50, "queue": "replace", "cooldownMs": 4000 },
+          "trigger": { "id": "t1" },
+          "now": 1000,
+          "expect": { "action": "start", "reason": "ok" }
+        },
+        {
+          "effect": { "id": "a", "enabled": true, "priority": 50, "queue": "replace", "cooldownMs": 4000 },
+          "trigger": { "id": "t2" },
+          "now": 2000,
+          "expect": { "action": "drop", "reason": "cooldown" }
+        },
+        {
+          "effect": { "id": "a", "enabled": true, "priority": 50, "queue": "replace", "cooldownMs": 4000 },
+          "trigger": { "id": "t3" },
+          "now": 5000,
+          "expect": { "action": "replace", "reason": "ok" }
+        }
+      ]
+    },
+    {
+      "name": "ignore drops while busy",
+      "steps": [
+        {
+          "effect": { "id": "a", "enabled": true, "priority": 50, "queue": "queue", "cooldownMs": 0 },
+          "trigger": { "id": "t1" },
+          "now": 1000,
+          "expect": { "action": "start", "reason": "ok" }
+        },
+        {
+          "effect": { "id": "b", "enabled": true, "priority": 50, "queue": "ignore", "cooldownMs": 0 },
+          "trigger": { "id": "t2" },
+          "now": 1100,
+          "expect": { "action": "drop", "reason": "ignored-while-busy" }
+        }
+      ]
+    },
+    {
+      "name": "replace and interrupt preempt with the previous item reported",
+      "steps": [
+        {
+          "effect": { "id": "a", "enabled": true, "priority": 50, "queue": "queue", "cooldownMs": 0 },
+          "trigger": { "id": "t1" },
+          "now": 1000,
+          "expect": { "action": "start", "reason": "ok" }
+        },
+        {
+          "effect": { "id": "b", "enabled": true, "priority": 50, "queue": "replace", "cooldownMs": 0 },
+          "trigger": { "id": "t2" },
+          "now": 1100,
+          "expect": { "action": "replace", "reason": "ok", "preemptedEffectId": "a" }
+        },
+        {
+          "effect": { "id": "c", "enabled": true, "priority": 50, "queue": "interrupt", "cooldownMs": 0 },
+          "trigger": { "id": "t3" },
+          "now": 1200,
+          "expect": { "action": "replace", "reason": "ok", "preemptedEffectId": "b" }
+        }
+      ]
+    },
+    {
+      "name": "coexist starts while busy without disturbing the main slot",
+      "steps": [
+        {
+          "effect": { "id": "a", "enabled": true, "priority": 50, "queue": "queue", "cooldownMs": 0 },
+          "trigger": { "id": "t1" },
+          "now": 1000,
+          "expect": { "action": "start", "reason": "ok" }
+        },
+        {
+          "effect": { "id": "b", "enabled": true, "priority": 50, "queue": "coexist", "cooldownMs": 0 },
+          "trigger": { "id": "t2" },
+          "now": 1100,
+          "expect": { "action": "start", "reason": "ok" }
+        }
+      ],
+      "expectPlaying": "a"
+    },
+    {
+      "name": "queue inserts by priority and drops past the bound",
+      "options": { "maxQueue": 2 },
+      "steps": [
+        {
+          "effect": { "id": "main", "enabled": true, "priority": 50, "queue": "queue", "cooldownMs": 0 },
+          "trigger": { "id": "t0" },
+          "now": 1000,
+          "expect": { "action": "start", "reason": "ok" }
+        },
+        {
+          "effect": { "id": "low", "enabled": true, "priority": 10, "queue": "queue", "cooldownMs": 0 },
+          "trigger": { "id": "t1" },
+          "now": 1100,
+          "expect": { "action": "enqueue", "reason": "ok" }
+        },
+        {
+          "effect": { "id": "high", "enabled": true, "priority": 90, "queue": "queue", "cooldownMs": 0 },
+          "trigger": { "id": "t2" },
+          "now": 1200,
+          "expect": { "action": "enqueue", "reason": "ok" }
+        },
+        {
+          "effect": { "id": "extra", "enabled": true, "priority": 50, "queue": "queue", "cooldownMs": 0 },
+          "trigger": { "id": "t3" },
+          "now": 1300,
+          "expect": { "action": "drop", "reason": "queue-full" }
+        }
+      ],
+      "expectQueue": ["high", "low"]
+    }
+  ]
+}
